@@ -2,11 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from concurrent.futures import Future
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
+    moriio_connector as moriio_connector_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    HandshakeError,
+    MoRIIOAgentMetadata,
     MoRIIOMode,
     MoRIIOTransferAck,
     RemoteAllocInfo,
@@ -24,6 +31,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
     validate_moriio_heterogeneous_tp_kv_heads,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
+    MoRIIOWrapper,
     MoRIIOWriter,
 )
 
@@ -472,3 +480,420 @@ def test_requested_cudagraph_mode_is_never_overridden():
     assert (
         MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": False}) is False
     )
+
+
+def test_aborted_write_transfer_is_terminal_and_releases_producer_state():
+    """A WRITE with no schedulable layers must finish producer cleanup."""
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.moriio_config = SimpleNamespace(defer_timeout=5.0)
+    worker.moriio_wrapper = MoRIIOWrapper()
+    worker.moriio_wrapper.done_remote_allocate_req_dict["tx"] = object()
+    writer = MoRIIOWriter(worker)
+
+    writer.abort_transfer("tx")
+    writer._scheduled_writes["tx"] = 1
+    writer._scheduled_layers["tx"] = {"layer0"}
+    writer._sealed_writes["tx"] = 1
+    writer.abort_transfer("tx")
+
+    assert worker.moriio_wrapper.pop_finished_req_ids() == [MoRIIOTransferAck("tx")]
+    assert "tx" not in worker.moriio_wrapper.done_remote_allocate_req_dict
+    assert "tx" in worker.moriio_wrapper._terminal_transfer_ids
+    assert "tx" not in writer._scheduled_writes
+    assert "tx" not in writer._scheduled_layers
+    assert "tx" not in writer._sealed_writes
+
+
+def test_handshake_receive_has_a_real_socket_deadline(monkeypatch):
+    """An absent peer must not occupy the handshake worker forever."""
+
+    class TimeoutSocket:
+        def __init__(self):
+            self.options = {}
+
+        def send(self, payload):
+            pass
+
+        def setsockopt(self, option, value):
+            self.options[option] = value
+
+        def recv_multipart(self):
+            raise moriio_connector_module.zmq.Again()
+
+    class SocketContext:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def __enter__(self):
+            return self.sock
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 1
+    worker.tp_rank = 0
+    worker.moriio_config = SimpleNamespace(transfer_timeout=0.05)
+    sock = TimeoutSocket()
+    monkeypatch.setattr(
+        moriio_connector_module,
+        "zmq_ctx",
+        lambda socket_type, path: SocketContext(sock),
+    )
+
+    with pytest.raises(HandshakeError, match="receiving agent metadata"):
+        worker._moriio_handshake("127.0.0.1", 6301, 1, "engine_dp0")
+
+    timeout_ms = sock.options[moriio_connector_module.zmq.RCVTIMEO]
+    assert 1 <= timeout_ms <= 50
+
+
+def test_partial_handshake_does_not_register_remote_engine(monkeypatch):
+    """A missing frame retry must not duplicate remote registration."""
+    metadata = MoRIIOAgentMetadata(
+        engine_id="remote",
+        agent_metadata=b"agent",
+        kv_caches_base_addr=[0],
+        num_blocks=1,
+        block_len=1,
+        attn_backend_name="test",
+    )
+    first_frame = [
+        b"",
+        moriio_connector_module.msgspec.msgpack.encode(metadata),
+    ]
+
+    class PartialSocket:
+        def __init__(self):
+            self.frames = [first_frame]
+
+        def send(self, payload):
+            pass
+
+        def setsockopt(self, option, value):
+            pass
+
+        def recv_multipart(self):
+            if self.frames:
+                return self.frames.pop(0)
+            raise moriio_connector_module.zmq.Again()
+
+    class SocketContext:
+        def __enter__(self):
+            return PartialSocket()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeWrapper:
+        def __init__(self):
+            self.registered = []
+
+        def register_remote_engine(self, agent_metadata):
+            self.registered.append(agent_metadata)
+            return "agent-name"
+
+        def shutdown(self):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 1
+    worker.tp_rank = 0
+    worker.moriio_config = SimpleNamespace(transfer_timeout=0.05)
+    worker.moriio_wrapper = FakeWrapper()
+    worker.local_kv_cache_metadata = []
+    worker.remote_kv_cache_metadata = []
+    worker.layer_name_to_remote_kv_cache_metadata = {}
+    worker.remote_moriio_metadata = {}
+    monkeypatch.setattr(
+        moriio_connector_module,
+        "zmq_ctx",
+        lambda socket_type, path: SocketContext(),
+    )
+
+    with pytest.raises(HandshakeError, match="receiving KV-cache metadata"):
+        worker._moriio_handshake("127.0.0.1", 6301, 1, "engine_dp0")
+
+    assert worker.moriio_wrapper.registered == []
+
+
+class _ImmediateExecutor:
+    def submit(self, function, *args):
+        future: Future[Any] = Future()
+        try:
+            future.set_result(function(*args))
+        except Exception as error:
+            future.set_exception(error)
+        return future
+
+    def shutdown(self, wait=True):
+        pass
+
+
+class _QueuedExecutor:
+    def __init__(self):
+        self.tasks = []
+
+    def submit(self, function, *args):
+        future: Future[Any] = Future()
+        self.tasks.append((future, function, args))
+        return future
+
+    def run_next(self):
+        future, function, args = self.tasks.pop(0)
+        try:
+            future.set_result(function(*args))
+        except Exception as error:
+            future.set_exception(error)
+
+    def shutdown(self, wait=True):
+        pass
+
+
+def _first_contact_worker():
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 1
+    worker._remote_agents = {}
+    worker._engine_handshake_futures = {}
+    worker._handshake_lock = threading.RLock()
+    worker._handshake_initiation_executor = _ImmediateExecutor()
+    worker._failed_handshake_requests = set()
+    worker.aborted_transfers = []
+    worker._writer = SimpleNamespace(abort_transfer=worker.aborted_transfers.append)
+    worker._eager_handshaked_engines = set()
+    worker._reqs_to_send = {}
+    worker.moriio_config = SimpleNamespace(transfer_timeout=5.0)
+    worker.mode = MoRIIOMode.READ
+    worker.is_producer = False
+    worker.handshake_calls = []
+    worker._eager_handshake_all_dp_ranks = lambda metadata: None
+
+    def fake_handshake(
+        host,
+        port,
+        tp_size,
+        engine_id,
+        dp_rank,
+        tp_rank=None,
+        deadline=None,
+    ):
+        worker.handshake_calls.append(engine_id)
+        return {f"agent-{engine_id}"}
+
+    worker._moriio_handshake = fake_handshake
+    return worker
+
+
+def _meta(remote_dp_size=1, host="127.0.0.1", port=6301):
+    return SimpleNamespace(
+        remote_host=host,
+        remote_handshake_port=port,
+        remote_dp_size=remote_dp_size,
+        tp_size=1,
+        remote_engine_id=None,
+        transfer_id="tx",
+        local_block_ids=[1],
+        remote_block_ids=[1],
+        remote_notify_port=7000,
+        remote_dp_rank=0,
+        multi_pod_hosts=None,
+        remote_dp_size_local=remote_dp_size,
+    )
+
+
+def test_write_first_contact_schedules_first_layer_for_every_request():
+    """Every cold-peer WRITE includes the first attention layer."""
+    worker = _first_contact_worker()
+    worker.mode = MoRIIOMode.WRITE
+    worker.is_producer = True
+    started = []
+    worker._write_blocks_for_req = lambda req_id, meta, layer_name, kv_layer: (
+        started.append((req_id, layer_name))
+    )
+
+    metadata = SimpleNamespace(reqs_to_save={f"req-{i}": _meta() for i in range(4)})
+    worker.save_kv_layer(metadata, "layer0", object(), None)
+
+    assert sorted(started) == [
+        ("req-0", "layer0"),
+        ("req-1", "layer0"),
+        ("req-2", "layer0"),
+        ("req-3", "layer0"),
+    ]
+    assert worker.handshake_calls == ["127.0.0.1:6301_dp0"]
+
+
+def test_batch_waits_once_for_a_shared_handshake():
+    """One failed WRITE peer consumes one wait for the whole batch."""
+    worker = _first_contact_worker()
+    worker.mode = MoRIIOMode.WRITE
+    worker.is_producer = True
+    shared_future: Future[Any] = Future()
+    worker._background_moriio_handshake = lambda engine_id, meta: shared_future
+    wait_calls = []
+
+    def fail_wait(future, req_id, remote_engine_id):
+        wait_calls.append((future, req_id, remote_engine_id))
+        return False
+
+    worker._wait_for_handshake = fail_wait
+    worker._write_blocks_for_req = lambda *args: pytest.fail(
+        "started a write after the shared handshake failed"
+    )
+    metadata = SimpleNamespace(reqs_to_save={f"req-{i}": _meta() for i in range(4)})
+
+    worker.save_kv_layer(metadata, "layer0", object(), None)
+
+    assert wait_calls == [(shared_future, "req-0", "127.0.0.1:6301")]
+    assert worker._failed_handshake_requests == {
+        "req-0",
+        "req-1",
+        "req-2",
+        "req-3",
+    }
+    assert worker.aborted_transfers == ["tx", "tx", "tx", "tx"]
+
+
+def test_queued_engine_gets_full_timeout_when_execution_starts(monkeypatch):
+    """A queued engine must not inherit an earlier peer's deadline."""
+    worker = _first_contact_worker()
+    executor = _QueuedExecutor()
+    worker._handshake_initiation_executor = executor
+    now = [0.0]
+    deadlines = {}
+    monkeypatch.setattr(moriio_connector_module.time, "monotonic", lambda: now[0])
+
+    def record_deadline(
+        host,
+        port,
+        tp_size,
+        engine_id,
+        dp_rank,
+        tp_rank=None,
+        deadline=None,
+    ):
+        deadlines[engine_id] = deadline
+        return {f"agent-{engine_id}"}
+
+    worker._moriio_handshake = record_deadline
+    worker._background_moriio_handshake("engine-a", _meta(host="engine-a"))
+    worker._background_moriio_handshake("engine-b", _meta(host="engine-b"))
+
+    now[0] = 100.0
+    executor.run_next()
+    executor.run_next()
+    now[0] = 200.0
+    executor.run_next()
+    executor.run_next()
+
+    assert deadlines == {"engine-a_dp0": 105.0, "engine-b_dp0": 205.0}
+
+
+def test_remote_engine_ready_requires_every_dp_rank():
+    worker = _first_contact_worker()
+    worker._remote_agents = {"eng_dp0": {"a"}}
+
+    assert not worker._remote_engine_ready("eng", 2)
+
+    worker._remote_agents["eng_dp1"] = {"b"}
+    assert worker._remote_engine_ready("eng", 2)
+
+
+def test_partial_dp_failure_retries_only_missing_rank():
+    worker = _first_contact_worker()
+    failed = {"127.0.0.1:6301_dp1"}
+
+    def flaky(
+        host,
+        port,
+        tp_size,
+        engine_id,
+        dp_rank,
+        tp_rank=None,
+        deadline=None,
+    ):
+        worker.handshake_calls.append(engine_id)
+        if engine_id in failed:
+            raise RuntimeError("dp1 unreachable")
+        return {f"agent-{engine_id}"}
+
+    worker._moriio_handshake = flaky
+    future = worker._background_moriio_handshake("127.0.0.1:6301", _meta(2))
+    assert not worker._wait_for_handshake(future, "req-0", "127.0.0.1:6301")
+    assert sorted(worker.handshake_calls) == [
+        "127.0.0.1:6301_dp0",
+        "127.0.0.1:6301_dp1",
+    ]
+
+    failed.clear()
+    worker.handshake_calls.clear()
+    worker._begin_handshake_step()
+    future = worker._background_moriio_handshake("127.0.0.1:6301", _meta(2))
+    assert worker._wait_for_handshake(future, "req-0", "127.0.0.1:6301")
+    assert worker.handshake_calls == ["127.0.0.1:6301_dp1"]
+
+
+def test_write_handshake_failure_is_not_retried_per_layer():
+    worker = _first_contact_worker()
+    worker.mode = MoRIIOMode.WRITE
+    worker.is_producer = True
+
+    def always_fails(
+        host,
+        port,
+        tp_size,
+        engine_id,
+        dp_rank,
+        tp_rank=None,
+        deadline=None,
+    ):
+        worker.handshake_calls.append(engine_id)
+        raise RuntimeError("unreachable")
+
+    worker._moriio_handshake = always_fails
+    worker._write_blocks_for_req = lambda *args: pytest.fail(
+        "scheduled a layer after the handshake failed"
+    )
+    metadata = SimpleNamespace(reqs_to_save={"req-0": _meta()})
+
+    worker.save_kv_layer(metadata, "layer0", object(), None)
+    worker.save_kv_layer(metadata, "layer1", object(), None)
+
+    assert worker.handshake_calls == ["127.0.0.1:6301_dp0"]
+    assert worker._failed_handshake_requests == {"req-0"}
+    assert worker.aborted_transfers == ["tx"]
+
+
+@pytest.mark.parametrize("task_source", ["queued", "deferred"])
+def test_terminal_write_task_discard_clears_scheduled_state(task_source):
+    writer = MoRIIOWriter.__new__(MoRIIOWriter)
+    writer._write_state_lock = threading.Lock()
+    writer._scheduled_writes = {"tx": 2}
+    writer._scheduled_layers = {"tx": {"dense0", "indexer"}}
+    writer._sealed_writes = {"tx": 2}
+    writer._is_transfer_terminal = lambda transfer_id: transfer_id == "tx"
+    task = SimpleNamespace(transfer_id="tx")
+
+    if task_source == "deferred":
+        writer._deferred_tasks = [task]
+        writer._defer_timeout = 1.0
+        writer._process_deferred_tasks()
+        assert writer._deferred_tasks == []
+    else:
+        tasks = iter([task])
+
+        def get_task(timeout):
+            try:
+                return next(tasks)
+            except StopIteration as error:
+                raise RuntimeError("stop worker loop") from error
+
+        writer._deferred_tasks = []
+        writer._process_deferred_tasks = lambda: None
+        writer._write_task_q = SimpleNamespace(get=get_task)
+        with pytest.raises(RuntimeError, match="stop worker loop"):
+            writer._write_worker_loop()
+
+    assert "tx" not in writer._scheduled_writes
+    assert "tx" not in writer._scheduled_layers
+    assert "tx" not in writer._sealed_writes

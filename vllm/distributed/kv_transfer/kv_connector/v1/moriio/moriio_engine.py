@@ -190,7 +190,7 @@ class MoRIIOWriter:
             except Empty:
                 continue
 
-            if self._is_transfer_terminal(task.transfer_id):
+            if self._discard_if_terminal(task.transfer_id):
                 continue
 
             # Check if remote blocks are ready
@@ -223,7 +223,7 @@ class MoRIIOWriter:
         still_deferred: list[WriteTask] = []
 
         for task in self._deferred_tasks:
-            if self._is_transfer_terminal(task.transfer_id):
+            if self._discard_if_terminal(task.transfer_id):
                 continue
             if now - task.enqueue_time > defer_timeout:
                 logger.error(
@@ -259,14 +259,25 @@ class MoRIIOWriter:
         with wrapper.lock:
             return wrapper._is_transfer_terminal_locked(transfer_id)
 
+    def _discard_if_terminal(self, transfer_id: TransferId) -> bool:
+        if not self._is_transfer_terminal(transfer_id):
+            return False
+        self._clear_transfer_state(transfer_id)
+        return True
+
     def _mark_request_done(self, transfer_id: str) -> None:
         """Mark a request done so its blocks are freed, even on transfer failure."""
         wrapper = self.worker.moriio_wrapper
         with wrapper.lock:
-            wrapper.done_req_ids.append(MoRIIOTransferAck(transfer_id))
-            wrapper.done_remote_allocate_req_dict.pop(transfer_id, None)
-            wrapper._mark_transfer_terminal_locked(transfer_id)
+            if not wrapper._is_transfer_terminal_locked(transfer_id):
+                wrapper.done_req_ids.append(MoRIIOTransferAck(transfer_id))
+                wrapper.done_remote_allocate_req_dict.pop(transfer_id, None)
+                wrapper._mark_transfer_terminal_locked(transfer_id)
         self._clear_transfer_state(transfer_id)
+
+    def abort_transfer(self, transfer_id: TransferId) -> None:
+        """Make a transfer terminal when it cannot schedule any WRITE tasks."""
+        self._mark_request_done(transfer_id)
 
     def _is_remote_ready(self, task: WriteTask) -> bool:
         """Check if remote blocks are allocated for this task.

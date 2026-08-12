@@ -3,7 +3,6 @@
 import logging
 import math
 import os
-import queue
 import threading
 import time
 from collections import defaultdict
@@ -1187,8 +1186,6 @@ class MoRIIOConnectorWorker:
         self.remote_moriio_metadata: dict[EngineId, MoRIIOAgentMetadata] = {}
         self.slot_size_bytes = 0
 
-        self.load_ready_flag: dict[str, bool] = {}
-        self.write_ready_flags: dict[str, bool] = {}
         self.kv_cache_shape = None
         self.block_shape = None
         self.kv_element_size = 0
@@ -1242,10 +1239,12 @@ class MoRIIOConnectorWorker:
             max_workers=1,
             thread_name_prefix="vllm-moriio-handshake-initiator",
         )
-        self._ready_requests = queue.Queue[tuple[ReqId, ReqMeta]]()
-        self._handshake_futures: dict[EngineId, Future[set[str]]] = {}
-        # Protects _handshake_futures and _remote_agents.
+        # One shared first-contact future per remote engine.
+        self._engine_handshake_futures: dict[EngineId, Future[bool]] = {}
+        # Protects _engine_handshake_futures and _remote_agents.
         self._handshake_lock = threading.RLock()
+        # Requests whose first contact failed in the current forward pass.
+        self._failed_handshake_requests: set[ReqId] = set()
         # Remote engines already covered by the eager pre-forward handshake.
         self._eager_handshaked_engines: set[EngineId] = set()
 
@@ -1499,6 +1498,7 @@ class MoRIIOConnectorWorker:
         expected_engine_id: str,
         remote_dp_rank: int = 0,
         remote_tp_rank: int | None = None,
+        deadline: float | None = None,
     ) -> set[str]:
         """Do a MoRIIO handshake with a remote instance.
 
@@ -1510,6 +1510,8 @@ class MoRIIOConnectorWorker:
         """
 
         start_time = time.perf_counter()
+        if deadline is None:
+            deadline = time.monotonic() + self.moriio_config.transfer_timeout
 
         # NOTE(rob): we need each rank to have a unique port. This is
         # a hack to keep us moving. We will switch when moving to etcd
@@ -1529,9 +1531,21 @@ class MoRIIOConnectorWorker:
 
         # Send query for the request.
         with zmq_ctx(zmq.DEALER, path) as sock:
+
+            def recv_frame(stage: str) -> list[bytes]:
+                remaining_ms = max(1, math.ceil((deadline - time.monotonic()) * 1000))
+                sock.setsockopt(zmq.RCVTIMEO, remaining_ms)
+                try:
+                    return sock.recv_multipart()
+                except zmq.Again as e:
+                    raise HandshakeError(
+                        f"MoRIIO handshake with {path} timed out while "
+                        f"receiving {stage}"
+                    ) from e
+
             logger.debug("prepare send msg INSTAZNCE: %s", path)
             sock.send(MoRIIOConstants.GET_META_MSG)
-            received_frame = sock.recv_multipart()
+            received_frame = recv_frame("agent metadata")
             if len(received_frame) != 2 or received_frame[0] != b"":
                 raise HandshakeError(f"Unexpected frame! {received_frame = }")
 
@@ -1542,19 +1556,6 @@ class MoRIIOConnectorWorker:
             logger.info(
                 "MoRIIO handshake: get metadata took: %s",
                 got_metadata_time - start_time,
-            )
-
-            self.moriio_wrapper.remote_engine_ip = host
-            remote_agent_name = self.moriio_wrapper.register_remote_engine(
-                metadata.agent_metadata
-            )
-
-            logger.debug(
-                "MoRIIO handshake: registered"
-                "remote agent %s for engine ID %s, path = %s",
-                remote_agent_name,
-                expected_engine_id,
-                path,
             )
 
             if len(self.local_kv_cache_metadata) > 0:
@@ -1572,12 +1573,29 @@ class MoRIIOConnectorWorker:
                 )
                 self.remote_kv_cache_metadata = []
 
-            received_frame = sock.recv_multipart()
+            received_frame = recv_frame("KV-cache metadata")
             if len(received_frame) != 2 or received_frame[0] != b"":
                 raise HandshakeError(f"unexpected frame! {received_frame = }")
             buf = received_frame[1]
+            remote_kv_cache_metadata = msgpack.loads(buf)
+
+            # Do not mutate the MoRI engine until the complete peer payload has
+            # arrived and decoded. A retry after a partial handshake must not
+            # register the same remote agent twice.
+            self.moriio_wrapper.remote_engine_ip = host
+            remote_agent_name = self.moriio_wrapper.register_remote_engine(
+                metadata.agent_metadata
+            )
+            logger.debug(
+                "MoRIIO handshake: registered"
+                "remote agent %s for engine ID %s, path = %s",
+                remote_agent_name,
+                expected_engine_id,
+                path,
+            )
+
             self.layer_name_to_remote_kv_cache_metadata[expected_engine_id] = (
-                msgpack.loads(buf)
+                remote_kv_cache_metadata
             )
             self.remote_moriio_metadata[expected_engine_id] = metadata
             setup_agent_time = time.perf_counter()
@@ -1594,36 +1612,83 @@ class MoRIIOConnectorWorker:
             remote_tp_size = self.world_size
         return get_moriio_remote_tp_rank(self.tp_rank, self.world_size, remote_tp_size)
 
+    def _remote_engine_ready(self, engine_name: EngineId, dp_size: int) -> bool:
+        """True once every advertised remote DP rank has completed handshake.
+
+        Checking only DP rank 0 lets a transfer start against a peer whose
+        other ranks were never registered, which then fails in
+        `_get_built_session` with a KeyError.
+        """
+        return all(
+            self.get_engine_name_with_dp(engine_name, dp_rank) in self._remote_agents
+            for dp_rank in range(max(1, int(dp_size)))
+        )
+
+    def _begin_handshake_step(self) -> None:
+        """Discard settled futures and reset failures for a new forward pass."""
+        with self._handshake_lock:
+            self._engine_handshake_futures = {
+                engine_id: future
+                for engine_id, future in self._engine_handshake_futures.items()
+                if not future.done()
+            }
+        self._failed_handshake_requests.clear()
+
     def _background_moriio_handshake(
-        self, req_id: ReqId, remote_engine_id: EngineId, meta: ReqMeta
-    ):
-        # Do MoRIIO handshake in background and add to _ready_requests when done.
-        fut = None
-        if remote_engine_id is not None:
-            fut = self._handshake_futures.get(remote_engine_id)
-        if fut is None:
-            host = meta.remote_host
-            port = int(meta.remote_handshake_port)
-            tp_size = int(meta.tp_size)
-            remote_dp_size = int(meta.remote_dp_size)
-            # Wide-EP multi-pod: remote DP ranks span pods at different IPs
-            # (ranks per pod = dp_local), so resolve the host per cur_dp_rank
-            # below instead of using a single host for all ranks.
-            pod_hosts = list(meta.multi_pod_hosts) if meta.multi_pod_hosts else [host]
-            remote_dp_size_local = int(meta.remote_dp_size_local) or remote_dp_size
+        self, remote_engine_id: EngineId, meta: ReqMeta
+    ) -> Future[bool]:
+        """Return the single in-flight handshake future for a remote engine.
 
-        def request_ready(_f: Future[Any], entry=(req_id, meta)):
-            logger.info("MoRIIO handshake done for request %s", req_id)
-            self._ready_requests.put(entry)
-            self.load_ready_flag[remote_engine_id] = True
-            self.write_ready_flags[remote_engine_id] = True
+        Callers in the same scheduler batch share one future, so first contact
+        happens once and every waiting request is resumed from it.
+        """
+        existing = self._engine_handshake_futures.get(remote_engine_id)
+        if existing is not None:
+            return existing
 
-        fut_list = []
+        host = meta.remote_host
+        port = int(meta.remote_handshake_port)
+        tp_size = int(meta.tp_size)
+        remote_dp_size = max(1, int(meta.remote_dp_size))
+        # Wide-EP multi-pod: remote DP ranks span pods at different IPs
+        # (ranks per pod = dp_local), so resolve the host per cur_dp_rank
+        # below instead of using a single host for all ranks.
+        pod_hosts = list(meta.multi_pod_hosts) if meta.multi_pod_hosts else [host]
+        remote_dp_size_local = int(meta.remote_dp_size_local) or remote_dp_size
+        deadline: float | None = None
 
-        # In dp(prefill)<->dp(decode) communication, we require an all-to-all handshake.
+        def handshake_with_deadline(
+            handshake_host: str,
+            handshake_port: int,
+            handshake_tp_size: int,
+            engine_id: str,
+            dp_rank: int = 0,
+            tp_rank: int | None = None,
+        ) -> set[str]:
+            # This engine may wait behind another engine on the serialized
+            # executor. Its timeout starts only when its first task runs.
+            nonlocal deadline
+            if deadline is None:
+                deadline = time.monotonic() + self.moriio_config.transfer_timeout
+            return self._moriio_handshake(
+                handshake_host,
+                handshake_port,
+                handshake_tp_size,
+                engine_id,
+                dp_rank,
+                tp_rank,
+                deadline=deadline,
+            )
 
+        fut_list: list[Future[set[str]]] = []
+
+        # In dp(prefill)<->dp(decode) communication, we require an all-to-all
+        # handshake. Skip ranks already registered so a retry after a partial
+        # failure only redials the ranks that are actually missing.
         for cur_dp_rank in range(remote_dp_size):
             dp_engine_id = self.get_engine_name_with_dp(remote_engine_id, cur_dp_rank)
+            if dp_engine_id in self._remote_agents:
+                continue
             _pod_idx = pod_index(cur_dp_rank, remote_dp_size_local)
             if _pod_idx >= len(pod_hosts):
                 _pod_idx = 0
@@ -1633,7 +1698,7 @@ class MoRIIOConnectorWorker:
             # keeps the global rank for uniqueness. Single-pod is bit-identical.
             _per_rank_local_dp = fold_local_rank(cur_dp_rank, remote_dp_size_local)
             future = self._handshake_initiation_executor.submit(
-                self._moriio_handshake,
+                handshake_with_deadline,
                 _per_rank_host,
                 port,
                 tp_size,
@@ -1644,23 +1709,48 @@ class MoRIIOConnectorWorker:
 
             def done_callback(f: Future[set[str]], eid=dp_engine_id):
                 with self._handshake_lock:
-                    self._handshake_futures.pop(eid, None)
                     try:
                         self._remote_agents[eid] = f.result()
                     except Exception:
                         logger.exception("Handshake with %s failed", eid)
 
             future.add_done_callback(done_callback)
-            self._handshake_futures[dp_engine_id] = future
 
-        # fut = fut_list
-        def wait_all_dp():
+        def wait_all_dp() -> bool:
+            # Runs on the same single-worker executor as the handshakes above,
+            # which are queued first, so those results are already available.
             for future in fut_list:
                 future.result()
+            if not self._remote_engine_ready(remote_engine_id, remote_dp_size):
+                raise HandshakeError(
+                    f"Not all remote DP ranks registered for {remote_engine_id}"
+                )
             return True
 
         all_done_future = self._handshake_initiation_executor.submit(wait_all_dp)
-        all_done_future.add_done_callback(request_ready)
+
+        self._engine_handshake_futures[remote_engine_id] = all_done_future
+        return all_done_future
+
+    def _wait_for_handshake(
+        self,
+        future: Future[bool],
+        req_id: ReqId,
+        remote_engine_id: EngineId,
+    ) -> bool:
+        """Return false when a WRITE handshake cannot be completed."""
+        try:
+            future.result(timeout=self.moriio_config.transfer_timeout)
+        except Exception:
+            logger.exception(
+                "MoRIIO handshake with %s failed for request %s; aborting its "
+                "WRITE transfer. Adjust with "
+                "kv_connector_extra_config.transfer_timeout",
+                remote_engine_id,
+                req_id,
+            )
+            return False
+        return True
 
     def _is_mla_cache_layer(self, layer_name: str) -> bool:
         return is_mla_cache_layer(self.layer_to_spec, layer_name)
@@ -2024,54 +2114,42 @@ class MoRIIOConnectorWorker:
             return
         if self.mode == MoRIIOMode.READ:
             return
-        remote_engine_id = None
+        pending: list[tuple[ReqId, ReqMeta, EngineId, Future[bool]]] = []
 
         for req_id, meta in metadata.reqs_to_save.items():
-            # we only need to check if dp0 in rank
+            if req_id in self._failed_handshake_requests:
+                continue
             remote_engine_id = (
                 str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
             )
 
             meta.remote_engine_id = remote_engine_id
 
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if dp0_remote_engine_id not in self._remote_agents:
+            if not self._remote_engine_ready(remote_engine_id, meta.remote_dp_size):
                 # Initiate handshake with remote engine to exchange metadata.
                 with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
-                        self._background_moriio_handshake(
-                            req_id, remote_engine_id, meta
+                    if not self._remote_engine_ready(
+                        remote_engine_id, meta.remote_dp_size
+                    ):
+                        future = self._background_moriio_handshake(
+                            remote_engine_id, meta
                         )
-
+                        pending.append((req_id, meta, remote_engine_id, future))
                         continue
             self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
 
-        if remote_engine_id is None:
-            return
-        _deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        while True:
-            if (
-                self._ready_requests.empty()
-                and remote_engine_id not in self.write_ready_flags
-            ):
-                if time.monotonic() > _deadline:
-                    logger.warning(
-                        "Timed out waiting for write_ready_flags[%s]; "
-                        "adjust with kv_connector_extra_config.transfer_timeout",
-                        remote_engine_id,
-                    )
-                    break
-                time.sleep(0.001)
-                continue
-            elif not self._ready_requests.empty() and (
-                remote_engine_id in self.write_ready_flags
-            ):
-                self._write_blocks_for_req(
-                    *self._ready_requests.get_nowait(), layer_name, kv_layer
+        # Resume every request that waited on first contact, not just one.
+        handshake_results: dict[Future[bool], bool] = {}
+        for req_id, meta, remote_engine_id, future in pending:
+            if future not in handshake_results:
+                handshake_results[future] = self._wait_for_handshake(
+                    future, req_id, remote_engine_id
                 )
-                break
+            if handshake_results[future]:
+                self._write_blocks_for_req(req_id, meta, layer_name, kv_layer)
             else:
-                break
+                self._failed_handshake_requests.add(req_id)
+                self._writer.abort_transfer(meta.transfer_id)
 
     def get_engine_name_with_dp(self, engine_name, dp_rank):
         return f"{engine_name}_dp{dp_rank}"
@@ -2129,6 +2207,28 @@ class MoRIIOConnectorWorker:
             remote_dp_size = int(meta.remote_dp_size)
             port = int(meta.remote_handshake_port)
             tp_size = int(meta.tp_size)
+            deadline: float | None = None
+
+            def handshake_with_deadline(
+                handshake_host: str,
+                handshake_port: int,
+                handshake_tp_size: int,
+                engine_id: str,
+                dp_rank: int = 0,
+                tp_rank: int | None = None,
+            ) -> set[str]:
+                nonlocal deadline
+                if deadline is None:
+                    deadline = time.monotonic() + self.moriio_config.transfer_timeout
+                return self._moriio_handshake(
+                    handshake_host,
+                    handshake_port,
+                    handshake_tp_size,
+                    engine_id,
+                    dp_rank,
+                    tp_rank,
+                    deadline=deadline,
+                )
 
             # Flexible mirror (TP prefill + MLA, world_size==1 decode): the read
             # round-robins over prefill TP ranks, so pre-warm a session to EVERY
@@ -2171,7 +2271,7 @@ class MoRIIOConnectorWorker:
                     ):
                         continue
                     fut = self._handshake_initiation_executor.submit(
-                        self._moriio_handshake,
+                        handshake_with_deadline,
                         meta.remote_host,
                         port,
                         tp_size,
@@ -2224,6 +2324,7 @@ class MoRIIOConnectorWorker:
         Start loading by triggering non-blocking moriio_xfer.
         We check for these trnxs to complete in each step().
         """
+        self._begin_handshake_step()
         self.transfer_id_to_request_id = metadata.transfer_id_to_request_id
         if self.is_producer:
             live_transfer_ids = set(self.transfer_id_to_request_id)
@@ -2246,63 +2347,12 @@ class MoRIIOConnectorWorker:
         # still blocked handshaking -> NCCL hang (see below).
         self._eager_handshake_all_dp_ranks(metadata)
 
-        wait_handshake_readd_req = False
-        remote_engine_id = None
-
         for req_id, meta in metadata.reqs_to_recv.items():
             remote_engine_id = (
                 str(meta.remote_host) + ":" + str(meta.remote_handshake_port)
             )
             meta.remote_engine_id = remote_engine_id
-            # The eager handshake above already covered every referenced engine
-            # (and keys the mirror per (dp, tp), which the DP-only dp0 probe below
-            # would miss). Only fall back to the lazy background handshake for an
-            # engine it did not cover.
-            dp0_remote_engine_id = self.get_engine_name_with_dp(remote_engine_id, 0)
-            if (
-                remote_engine_id not in self._eager_handshaked_engines
-                and dp0_remote_engine_id not in self._remote_agents
-            ):
-                # Initiate handshake with remote engine to exchange metadata.
-                with self._handshake_lock:
-                    if remote_engine_id not in self._remote_agents:
-                        self._background_moriio_handshake(
-                            req_id, remote_engine_id, meta
-                        )
-                        wait_handshake_readd_req = True
-
-                        continue
-
-            # Handshake already completed, start async read xfer.
             self._read_blocks_for_req(req_id, meta)
-        # Start transfers for requests whose handshakes have now finished.
-
-        if remote_engine_id is None and not wait_handshake_readd_req:
-            return
-        _deadline = time.monotonic() + self.moriio_config.transfer_timeout
-        while True:
-            if (
-                self._ready_requests.empty()
-                and remote_engine_id not in self.load_ready_flag
-                and wait_handshake_readd_req
-            ):
-                if time.monotonic() > _deadline:
-                    logger.warning(
-                        "Timed out waiting for load_ready_flag[%s]; "
-                        "adjust with kv_connector_extra_config.transfer_timeout",
-                        remote_engine_id,
-                    )
-                    break
-                time.sleep(0.001)
-                continue
-            elif (
-                not self._ready_requests.empty()
-                and remote_engine_id in self.load_ready_flag
-            ):
-                self._read_blocks_for_req(*self._ready_requests.get_nowait())
-                break
-            else:
-                break
 
         self._reqs_to_send.update(metadata.reqs_to_send)
 
