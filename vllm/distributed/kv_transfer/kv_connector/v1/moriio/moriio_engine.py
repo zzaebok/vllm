@@ -28,6 +28,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOConstants,
     MoRIIOError,
     MoRIIOTransferAck,
+    MoRIIOWriteAck,
     RemoteAllocInfo,
     TransferError,
     TransferId,
@@ -482,7 +483,11 @@ class MoRIIOWriter:
         # Send completion notification
         for remote_ip, remote_port in completion_endpoints:
             self.worker.moriio_wrapper.send_notify(
-                transfer_id, remote_ip, remote_port, message_type="write_done"
+                transfer_id,
+                remote_ip,
+                remote_port,
+                message_type="write_done",
+                message_fields={"producer_tp_size": self.worker.world_size},
             )
         # mark request as done, then we can free the blocks
         with self.worker.moriio_wrapper.lock:
@@ -532,7 +537,7 @@ class MoRIIOWrapper:
         self.lock = threading.Lock()
         self.done_req_ids: list[MoRIIOTransferAck] = []
         self.done_remote_allocate_req_dict: dict[TransferId, RemoteAllocInfo] = {}
-        self.done_write_cache_req_ids: list[str] = []
+        self.done_write_cache_req_ids: list[MoRIIOWriteAck | TransferId] = []
         self._terminal_transfer_ids: OrderedDict[TransferId, None] = OrderedDict()
         self._transfer_timeout = transfer_timeout
         self.notify_thread: threading.Thread | None = None
@@ -798,8 +803,17 @@ class MoRIIOWrapper:
             "Only decode can get WRITE completion messages"
         )
         transfer_id = data["transfer_id"]
+        producer_tp_size = data.get("producer_tp_size")
+        if producer_tp_size is not None and int(producer_tp_size) <= 0:
+            raise MoRIIOError(
+                f"Invalid producer_tp_size in write_done message: {producer_tp_size}"
+            )
         with self.lock:
-            self.done_write_cache_req_ids.append(transfer_id)
+            self.done_write_cache_req_ids.append(
+                transfer_id
+                if producer_tp_size is None
+                else MoRIIOWriteAck(transfer_id, int(producer_tp_size))
+            )
 
     def _handle_release_message(self, data: dict):
         assert get_role() == ROLE.PRODUCER, (
@@ -889,7 +903,7 @@ class MoRIIOWrapper:
     def pop_finished_write_req_ids(self):
         # Call the consumer in write mode to get the collection after write completion
         with self.lock:
-            done_write_cache = set(self.done_write_cache_req_ids)
+            done_write_cache = list(self.done_write_cache_req_ids)
             self.done_write_cache_req_ids = []
         return done_write_cache
 

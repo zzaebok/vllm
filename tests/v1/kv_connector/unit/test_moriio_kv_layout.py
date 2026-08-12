@@ -37,6 +37,7 @@ msgpack = importlib.import_module("msgpack")
 ROLE = moriio_common.ROLE
 MoRIIOError = moriio_common.MoRIIOError
 MoRIIOTransferAck = moriio_common.MoRIIOTransferAck
+MoRIIOWriteAck = moriio_common.MoRIIOWriteAck
 RemoteAllocInfo = moriio_common.RemoteAllocInfo
 WriteTask = moriio_common.WriteTask
 set_role = moriio_common.set_role
@@ -417,7 +418,9 @@ def test_write_scheduler_deduplicates_layers_and_seals_expected_count():
     request_info = RemoteAllocInfo(block_ids=[4, 5])
     wrapper = _wrapper_for_messages()
     wrapper.done_remote_allocate_req_dict["xfer"] = request_info
-    writer = _writer_with_fake_worker(SimpleNamespace(moriio_wrapper=wrapper))
+    writer = _writer_with_fake_worker(
+        SimpleNamespace(moriio_wrapper=wrapper, world_size=8)
+    )
 
     assert writer.schedule_write(_write_task("dense0"))
     assert not writer.schedule_write(_write_task("dense0"))
@@ -491,7 +494,15 @@ def test_write_completion_notifies_once_after_all_sealed_writes_finish():
     writer._mark_write_done("xfer", request_info)
     writer._finalize_if_complete("xfer", request_info)
 
-    assert wrapper.notifications == [("xfer", "127.0.0.1", 7002, "write_done", None)]
+    assert wrapper.notifications == [
+        (
+            "xfer",
+            "127.0.0.1",
+            7002,
+            "write_done",
+            {"producer_tp_size": 8},
+        )
+    ]
     assert wrapper.done_req_ids == [MoRIIOTransferAck("xfer")]
     assert wrapper.done_remote_allocate_req_dict == {}
     assert wrapper.wait_count == 1
@@ -606,6 +617,18 @@ def test_late_remote_blocks_message_is_ignored_after_transfer_done():
             id="write-done",
         ),
         pytest.param(
+            ROLE.CONSUMER,
+            msgpack.dumps(
+                {
+                    "type": "write_done",
+                    "transfer_id": "xfer",
+                    "producer_tp_size": 8,
+                }
+            ),
+            MoRIIOWriteAck("xfer", 8),
+            id="write-done-producer-tp-size",
+        ),
+        pytest.param(
             ROLE.PRODUCER,
             msgpack.dumps({"type": "release", "transfer_id": "xfer"}),
             MoRIIOTransferAck("xfer"),
@@ -642,6 +665,8 @@ def test_moriio_wrapper_routes_valid_messages(role, payload, expected):
         assert request_info.decode_dp_rank == 3
     elif expected == "write_done":
         assert wrapper.done_write_cache_req_ids == ["xfer"]
+    elif isinstance(expected, MoRIIOWriteAck):
+        assert wrapper.done_write_cache_req_ids == [expected]
     elif expected == "plain":
         assert completions == ["xfer"]
     else:
@@ -676,6 +701,18 @@ def test_moriio_wrapper_routes_valid_messages(role, payload, expected):
             b"",
             "Unhandled message format",
             id="empty-completion",
+        ),
+        pytest.param(
+            ROLE.CONSUMER,
+            msgpack.dumps(
+                {
+                    "type": "write_done",
+                    "transfer_id": "xfer",
+                    "producer_tp_size": 0,
+                }
+            ),
+            "Invalid producer_tp_size",
+            id="invalid-write-producer-tp-size",
         ),
     ],
 )

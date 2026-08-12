@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     MoRIIOTransferAck,
+    MoRIIOWriteAck,
     RemoteAllocInfo,
     WriteTask,
     get_port_offset,
@@ -24,11 +25,14 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
     MoRIIOConnectorScheduler,
     MoRIIOConnectorWorker,
     get_moriio_expected_ack_count,
+    get_moriio_expected_write_ack_count,
     get_moriio_remote_tp_rank,
     resolve_moriio_transfer_ack,
+    resolve_moriio_write_ack,
     validate_moriio_heterogeneous_tp_kv_heads,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
+    MoRIIOWrapper,
     MoRIIOWriter,
 )
 
@@ -232,6 +236,93 @@ def test_write_tasks_keep_each_requests_decode_topology():
     ]
     assert not hasattr(worker, "multi_pod_hosts")
     assert not hasattr(worker, "remote_dp_size_local")
+
+
+def test_write_completion_waits_for_every_mapped_producer():
+    ack = MoRIIOWriteAck("tx-write", producer_tp_size=8)
+    notification_counts: dict[str, int] = {}
+    completed_transfer_ids: set[str] = set()
+    results = [
+        resolve_moriio_write_ack(
+            ack,
+            decode_tp_size=4,
+            live_transfer_ids={"tx-write"},
+            notification_counts=notification_counts,
+            completed_transfer_ids=completed_transfer_ids,
+        )
+        for _ in range(3)
+    ]
+
+    assert results == [None, "tx-write", None]
+    assert notification_counts == {}
+    assert completed_transfer_ids == {"tx-write"}
+
+
+def test_write_completion_rejects_decode_tp_larger_than_producer():
+    with pytest.raises(NotImplementedError, match="decode TP larger"):
+        get_moriio_expected_write_ack_count(4, 8)
+
+
+def test_worker_counts_write_done_fan_in_and_retries_early_ack():
+    class FakeWrapper:
+        def __init__(self):
+            self.batches = [
+                [MoRIIOWriteAck("tx-write", 8)],
+                [MoRIIOWriteAck("tx-write", 8)],
+                [MoRIIOWriteAck("tx-early", 4)],
+                [],
+            ]
+
+        def pop_finished_write_req_ids(self):
+            return self.batches.pop(0)
+
+        def shutdown(self):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.WRITE
+    worker.world_size = 4
+    worker.moriio_wrapper = FakeWrapper()
+    worker.transfer_id_to_request_id = {"tx-write": "req-write"}
+    worker._pending_unmapped_write_acks = []
+    worker._write_notification_counts = {}
+    worker._completed_write_notifications = set()
+
+    assert worker.get_finished() == (set(), set())
+    assert worker.get_finished() == (set(), {"req-write"})
+    assert worker.get_finished() == (set(), set())
+    assert worker._pending_unmapped_write_acks == [MoRIIOWriteAck("tx-early", 4)]
+
+    worker.transfer_id_to_request_id = {"tx-early": "req-early"}
+    assert worker.get_finished() == (set(), {"req-early"})
+    assert worker._pending_unmapped_write_acks == []
+
+
+def test_write_completion_queue_preserves_duplicate_transfer_ids():
+    ack = MoRIIOWriteAck("tx-write", 8)
+    wrapper = MoRIIOWrapper.__new__(MoRIIOWrapper)
+    wrapper.lock = threading.Lock()
+    wrapper.done_write_cache_req_ids = [ack, ack]
+
+    assert wrapper.pop_finished_write_req_ids() == [ack, ack]
+
+
+def test_write_done_message_carries_producer_tp_size():
+    previous_role = moriio_common.get_role()
+    try:
+        moriio_common.set_role(moriio_common.ROLE.CONSUMER)
+        wrapper = MoRIIOWrapper.__new__(MoRIIOWrapper)
+        wrapper.lock = threading.Lock()
+        wrapper.done_write_cache_req_ids = []
+
+        wrapper._handle_write_done_message(
+            {"transfer_id": "tx-write", "producer_tp_size": 8}
+        )
+
+        assert wrapper.done_write_cache_req_ids == [MoRIIOWriteAck("tx-write", 8)]
+    finally:
+        moriio_common.set_role(previous_role)
 
 
 def test_advertised_notify_port_remains_the_cluster_base(monkeypatch):

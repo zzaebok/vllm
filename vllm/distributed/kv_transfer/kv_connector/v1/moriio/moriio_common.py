@@ -48,6 +48,11 @@ class MoRIIOTransferAck(NamedTuple):
     consumer_tp_size: int = 1
 
 
+class MoRIIOWriteAck(NamedTuple):
+    transfer_id: TransferId
+    producer_tp_size: int = 1
+
+
 @dataclass
 class WriteTask:
     request_id: ReqId

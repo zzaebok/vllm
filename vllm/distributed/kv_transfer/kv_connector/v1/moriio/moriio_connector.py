@@ -33,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOConstants,
     MoRIIOMode,
     MoRIIOTransferAck,
+    MoRIIOWriteAck,
     ReqId,
     ReqMeta,
     TransferId,
@@ -139,6 +140,13 @@ def get_moriio_expected_ack_count(producer_tp_size: int, consumer_tp_size: int) 
     return consumer_tp_size // producer_tp_size
 
 
+def get_moriio_expected_write_ack_count(
+    producer_tp_size: int, decode_tp_size: int
+) -> int:
+    validate_moriio_write_tp_topology(producer_tp_size, decode_tp_size)
+    return producer_tp_size // decode_tp_size
+
+
 def resolve_moriio_transfer_ack(
     ack: MoRIIOTransferAck | TransferId,
     producer_tp_size: int,
@@ -160,6 +168,29 @@ def resolve_moriio_transfer_ack(
     count = notification_counts.get(transfer_id, 0) + 1
     if count < expected_acks:
         notification_counts[transfer_id] = count
+        return None
+
+    notification_counts.pop(transfer_id, None)
+    completed_transfer_ids.add(transfer_id)
+    return transfer_id
+
+
+def resolve_moriio_write_ack(
+    ack: MoRIIOWriteAck | TransferId,
+    decode_tp_size: int,
+    live_transfer_ids: Collection[TransferId],
+    notification_counts: dict[TransferId, int],
+    completed_transfer_ids: set[TransferId],
+) -> TransferId | None:
+    producer_tp_size = decode_tp_size if isinstance(ack, str) else ack.producer_tp_size
+    transfer_id = ack if isinstance(ack, str) else ack.transfer_id
+    if transfer_id not in live_transfer_ids or transfer_id in completed_transfer_ids:
+        return None
+
+    expected = get_moriio_expected_write_ack_count(producer_tp_size, decode_tp_size)
+    received = notification_counts.get(transfer_id, 0) + 1
+    if received < expected:
+        notification_counts[transfer_id] = received
         return None
 
     notification_counts.pop(transfer_id, None)
@@ -1101,9 +1132,9 @@ class MoRIIOConnectorWorker:
         self._handle_request_thread = None
         self._ping_thread = None
         self._writer = MoRIIOWriter(self)
-        # Completions that arrived before transfer_id_to_request_id was populated.
-        # Retried each step until the mapping is established.
-        self._unmatched_write_completions: set[str] = set()
+        self._pending_unmapped_write_acks: list[MoRIIOWriteAck | TransferId] = []
+        self._write_notification_counts: dict[TransferId, int] = {}
+        self._completed_write_notifications: set[TransferId] = set()
         # Producer-side READ-mode ACK fan-in. When decode TP is larger than
         # prefill TP, multiple decode ranks can read from one prefill rank and
         # notify the same transfer_id. Blocks are reusable only after all ACKs.
@@ -1858,11 +1889,26 @@ class MoRIIOConnectorWorker:
             }
         else:
             if self.mode == MoRIIOMode.WRITE:
-                fresh = self.moriio_wrapper.pop_finished_write_req_ids()
-                # Accumulate with any completions that arrived before their
-                # transfer_id was registered in transfer_id_to_request_id.
-                self._unmatched_write_completions |= fresh
-                done_recving = self._unmatched_write_completions
+                finished_acks = self._pending_unmapped_write_acks + list(
+                    self.moriio_wrapper.pop_finished_write_req_ids()
+                )
+                self._pending_unmapped_write_acks = []
+                resolved_write_transfer_ids: set[TransferId] = set()
+                for ack in finished_acks:
+                    transfer_id = ack if isinstance(ack, str) else ack.transfer_id
+                    if transfer_id not in self.transfer_id_to_request_id:
+                        self._pending_unmapped_write_acks.append(ack)
+                        continue
+                    resolved_transfer_id = resolve_moriio_write_ack(
+                        ack,
+                        decode_tp_size=self.world_size,
+                        live_transfer_ids=self.transfer_id_to_request_id.keys(),
+                        notification_counts=self._write_notification_counts,
+                        completed_transfer_ids=self._completed_write_notifications,
+                    )
+                    if resolved_transfer_id is not None:
+                        resolved_write_transfer_ids.add(resolved_transfer_id)
+                done_recving = resolved_write_transfer_ids
             else:
                 # READ mode: the scheduler treats KV loads as synchronous
                 # (load_kv_async=False), so requests go directly to RUNNING
@@ -1879,15 +1925,6 @@ class MoRIIOConnectorWorker:
                 lambda id: id in self.transfer_id_to_request_id, done_recving
             )
         }
-        if self.mode == MoRIIOMode.WRITE and not self.is_producer:
-            # Remove the ones we successfully matched; leave unmatched for retry.
-            matched_xfer_ids = {
-                id
-                for id in self._unmatched_write_completions
-                if id in self.transfer_id_to_request_id
-            }
-            self._unmatched_write_completions -= matched_xfer_ids
-
         return done_sending, done_recving
 
     def wait_for_layer_load(self, layer_name: str) -> None:
@@ -2228,6 +2265,13 @@ class MoRIIOConnectorWorker:
             self.moriio_wrapper.async_wait_reqid()
             return
         if self.mode == MoRIIOMode.WRITE:
+            live_transfer_ids = set(self.transfer_id_to_request_id)
+            self._write_notification_counts = {
+                transfer_id: count
+                for transfer_id, count in self._write_notification_counts.items()
+                if transfer_id in live_transfer_ids
+            }
+            self._completed_write_notifications.intersection_update(live_transfer_ids)
             return
 
         # Handshake every referenced remote prefill rank up front, before any
