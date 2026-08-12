@@ -2230,6 +2230,35 @@ class MoRIIOConnectorWorker:
                     deadline=deadline,
                 )
 
+            remote_dp_size_local = int(meta.remote_dp_size_local) or remote_dp_size
+            pod_hosts = (
+                list(meta.multi_pod_hosts)
+                if meta.multi_pod_hosts
+                else [meta.remote_host]
+            )
+
+            def target_for_rank(
+                dp_rank: int,
+                tp_rank: int | None,
+                remote_engine_id: str = remote_engine_id,
+                remote_dp_size_local: int = remote_dp_size_local,
+                pod_hosts: tuple[str, ...] = tuple(pod_hosts),
+                fallback_host: str = meta.remote_host,
+            ) -> tuple[str, str, int, int | None]:
+                remote_pod = pod_index(dp_rank, remote_dp_size_local)
+                host = (
+                    pod_hosts[remote_pod]
+                    if 0 <= remote_pod < len(pod_hosts)
+                    else fallback_host
+                )
+                local_dp_rank = fold_local_rank(dp_rank, remote_dp_size_local)
+                engine_id = (
+                    self.get_engine_name_with_dp_tp(remote_engine_id, dp_rank, tp_rank)
+                    if tp_rank is not None
+                    else self.get_engine_name_with_dp(remote_engine_id, dp_rank)
+                )
+                return engine_id, host, local_dp_rank, tp_rank
+
             # Flexible mirror (TP prefill + MLA, world_size==1 decode): the read
             # round-robins over prefill TP ranks, so pre-warm a session to EVERY
             # (dp, tp) rank. Other configs pre-warm per DP rank (tp resolved by
@@ -2242,20 +2271,15 @@ class MoRIIOConnectorWorker:
                 and remote_dp_size == 1
                 and tp_size > 1
             )
-            # (engine_id, dp_rank, tp_rank_or_None); tp_rank is None on the legacy
-            # path so _moriio_handshake falls back to its _remote_tp_rank mapping.
-            targets: list[tuple[Any, int, int | None]]
+            targets: list[tuple[str, str, int, int | None]]
             if flexible:
                 targets = [
-                    (self.get_engine_name_with_dp_tp(remote_engine_id, dp, tp), dp, tp)
+                    target_for_rank(dp, tp)
                     for dp in range(remote_dp_size)
-                    for tp in range(max(1, tp_size))
+                    for tp in range(tp_size)
                 ]
             else:
-                targets = [
-                    (self.get_engine_name_with_dp(remote_engine_id, dp), dp, None)
-                    for dp in range(remote_dp_size)
-                ]
+                targets = [target_for_rank(dp, None) for dp in range(remote_dp_size)]
 
             # Submit handshakes for every not-yet-known target UNDER the lock; do
             # NOT hold it across the join or the collective (a stalled recv must
@@ -2264,7 +2288,7 @@ class MoRIIOConnectorWorker:
             # layer metadata is half-handshaked and would KeyError at read time.
             futures: list[tuple[str, Future[set[str]]]] = []
             with self._handshake_lock:
-                for eid, cur_dp_rank, cur_tp_rank in targets:
+                for eid, cur_host, cur_dp_rank, cur_tp_rank in targets:
                     if (
                         eid in self._remote_agents
                         and eid in self.layer_name_to_remote_kv_cache_metadata
@@ -2272,7 +2296,7 @@ class MoRIIOConnectorWorker:
                         continue
                     fut = self._handshake_initiation_executor.submit(
                         handshake_with_deadline,
-                        meta.remote_host,
+                        cur_host,
                         port,
                         tp_size,
                         eid,

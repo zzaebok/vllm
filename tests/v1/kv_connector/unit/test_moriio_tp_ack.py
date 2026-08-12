@@ -14,9 +14,11 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     HandshakeError,
     MoRIIOAgentMetadata,
+    MoRIIOConnectorMetadata,
     MoRIIOMode,
     MoRIIOTransferAck,
     RemoteAllocInfo,
+    ReqMeta,
     WriteTask,
     get_port_offset,
     resolve_peer_tp_size,
@@ -862,6 +864,58 @@ def test_write_handshake_failure_is_not_retried_per_layer():
     assert worker.handshake_calls == ["127.0.0.1:6301_dp0"]
     assert worker._failed_handshake_requests == {"req-0"}
     assert worker.aborted_transfers == ["tx"]
+
+
+def test_eager_handshake_selects_wide_ep_pod_and_local_dp_rank(monkeypatch):
+    calls = []
+
+    class ImmediateExecutor:
+        def submit(self, function, *args):
+            calls.append(args)
+            future: Future[Any] = Future()
+            future.set_result(function(*args))
+            return future
+
+        def shutdown(self, wait=False):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 1
+    worker.tp_rank = 0
+    worker.use_mla = False
+    worker.moriio_config = SimpleNamespace(transfer_timeout=5.0)
+    worker.tp_group = SimpleNamespace(cpu_group=object())
+    worker._eager_handshaked_engines = set()
+    worker._remote_agents = {}
+    worker.layer_name_to_remote_kv_cache_metadata = {}
+    worker._handshake_lock = threading.RLock()
+    worker._handshake_initiation_executor = ImmediateExecutor()
+    worker._moriio_handshake = lambda *args, **kwargs: {args[3]}
+    monkeypatch.setattr("torch.distributed.all_reduce", lambda *args, **kwargs: None)
+    metadata = MoRIIOConnectorMetadata()
+    metadata.reqs_to_recv["req"] = ReqMeta(
+        transfer_id="tx",
+        local_block_ids=[1],
+        remote_block_ids=[2],
+        remote_host="pod0",
+        remote_port=6000,
+        remote_handshake_port=6000,
+        remote_notify_port=7000,
+        remote_engine_id="engine",
+        tp_size=2,
+        remote_dp_size=4,
+        multi_pod_hosts=["pod0", "pod1"],
+        remote_dp_size_local=2,
+    )
+
+    worker._eager_handshake_all_dp_ranks(metadata)
+
+    assert [(args[0], args[4]) for args in calls] == [
+        ("pod0", 0),
+        ("pod0", 1),
+        ("pod1", 0),
+        ("pod1", 1),
+    ]
 
 
 @pytest.mark.parametrize("task_source", ["queued", "deferred"])
