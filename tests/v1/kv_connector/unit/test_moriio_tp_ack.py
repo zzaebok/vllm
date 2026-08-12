@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio import moriio_common
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     MoRIIOTransferAck,
@@ -174,6 +175,37 @@ def test_write_done_uses_per_request_decode_tp_size():
         ("host-a", base + get_port_offset(1, 0, 2)),
         ("host-b", base + get_port_offset(1, 0, 4)),
     ]
+
+
+def test_advertised_notify_port_remains_the_cluster_base(monkeypatch):
+    monkeypatch.setattr(moriio_common, "get_tensor_model_parallel_rank", lambda: 1)
+    monkeypatch.setattr(
+        moriio_common, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(moriio_common, "get_open_port", lambda: 32000)
+    config = moriio_common.MoRIIOConfig.from_vllm_config(
+        SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MoRIIOConnector",
+                kv_role="kv_both",
+                kv_connector_extra_config={
+                    "host_ip": "127.0.0.1",
+                    "http_port": 8000,
+                    "handshake_port": 6000,
+                    "notify_port": 7000,
+                    "read_mode": True,
+                },
+            ),
+            parallel_config=SimpleNamespace(
+                data_parallel_rank=1,
+                data_parallel_size=2,
+                data_parallel_size_local=2,
+            ),
+        )
+    )
+
+    assert config.notify_port == 7003
+    assert config.base_notify_port == 7000
 
 
 def test_remote_tp_rank_p4_d8_floor_maps_decode_to_prefill():

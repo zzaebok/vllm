@@ -315,6 +315,13 @@ class MoRIIOConfig:
     num_workers: int = 1
     backend: str = "rdma"
 
+    @property
+    def base_notify_port(self) -> int:
+        """Configured cluster-base port before the local DP/TP offset."""
+        return self.notify_port - get_port_offset(
+            self.dp_rank, self.tp_rank, self.tp_size
+        )
+
     @classmethod
     def from_vllm_config(cls, vllm_config: VllmConfig) -> "MoRIIOConfig":
         # Port Configuration:

@@ -1362,7 +1362,7 @@ class MoRIIOConnectorWorker:
         zmq_address = (
             f"host:{self.local_ip},"
             f"handshake:{self.handshake_port},"
-            f"notify:{self.notify_port}"
+            f"notify:{self.moriio_config.base_notify_port}"
         )
         role = "P" if self.is_producer else "D"
 
