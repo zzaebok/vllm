@@ -659,10 +659,13 @@ class MoRIIOConnectorScheduler:
                             # Get unhashed blocks to pull from remote.
                             local_block_ids = blocks.get_block_ids()[0]
                             assert len(local_block_ids) <= len(remote_block_ids)
+                            remote_block_ids = list(remote_block_ids)
                             if len(local_block_ids) != len(remote_block_ids):
-                                local_block_ids = remote_block_ids[
-                                    -len(local_block_ids) :
-                                ]
+                                remote_block_ids = (
+                                    remote_block_ids[-len(local_block_ids) :]
+                                    if local_block_ids
+                                    else []
+                                )
                         else:
                             # If remote_blocks and num_external_tokens = 0, we have
                             # a full prefix cache hit on the D worker. We need to call
@@ -675,7 +678,9 @@ class MoRIIOConnectorScheduler:
                         )
                         # Snapshot params for chunked prefill consumption
                         # in build_connector_meta (see comment above).
-                        self._req_kv_params[request.request_id] = dict(params)
+                        params_snapshot = dict(params)
+                        params_snapshot["remote_block_ids"] = remote_block_ids
+                        self._req_kv_params[request.request_id] = params_snapshot
                     else:
                         logger.warning(
                             "Got invalid KVTransferParams: %s. This "

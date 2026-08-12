@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,6 +12,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnector,
+    MoRIIOConnectorScheduler,
     MoRIIOConnectorWorker,
     get_moriio_expected_ack_count,
     get_moriio_remote_tp_rank,
@@ -62,6 +64,41 @@ def test_remote_tp_rank_invalid_non_multiple_tp_raises(
 ):
     with pytest.raises(ValueError, match="multiple"):
         get_moriio_remote_tp_rank(local_tp_rank, local_tp_size, remote_tp_size)
+
+
+def test_read_metadata_keeps_local_ids_and_aligns_remote_tail():
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.mode = MoRIIOMode.READ
+    scheduler.is_producer = False
+    scheduler.transfer_id_to_request_id = {}
+    scheduler.request_id_to_transfer_id = {}
+    scheduler._reqs_need_recv = {}
+    scheduler._reqs_need_save = {}
+    scheduler._reqs_need_pending_save = {}
+    scheduler._reqs_need_send = {}
+    scheduler._req_kv_params = {}
+
+    request = SimpleNamespace(
+        request_id="req",
+        kv_transfer_params={
+            "do_remote_prefill": True,
+            "do_remote_decode": False,
+            "transfer_id": "tx",
+            "remote_block_ids": [40, 41, 42],
+            "remote_engine_id": "prefill",
+            "remote_host": "127.0.0.1",
+            "remote_handshake_port": 6300,
+            "remote_notify_port": 6400,
+        },
+    )
+    blocks = SimpleNamespace(get_block_ids=lambda: ([7, 8],))
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=32)
+    metadata = scheduler.build_connector_meta(SimpleNamespace())
+
+    req_meta = metadata.reqs_to_recv["req"]
+    assert req_meta.local_block_ids == [7, 8]
+    assert req_meta.remote_block_ids == [41, 42]
 
 
 @pytest.mark.parametrize(
