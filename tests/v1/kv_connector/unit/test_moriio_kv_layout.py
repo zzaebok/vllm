@@ -344,20 +344,27 @@ def test_write_transfer_plan_caches_offsets_per_geometry():
         "dense1": torch.empty((8, 2, 4, 2, 3), dtype=torch.bfloat16),
         "indexer": torch.empty((8, 4, 3), dtype=torch.bfloat16),
     }
-    calls: list[str] = []
+    calls: list[tuple[str, int]] = []
 
     class FakeWorker:
         kv_caches: dict[str, torch.Tensor]
         layer_name_to_local_kv_cache_metadata: dict[str, list[Any]]
+        world_size: int
 
         def _compute_block_transfer_offsets(
-            self, layer_name, local_block_ids, remote_block_ids, remote_moriio_meta
+            self,
+            layer_name,
+            local_block_ids,
+            remote_block_ids,
+            remote_moriio_meta,
+            remote_tp_size=None,
         ):
-            calls.append(layer_name)
+            calls.append((layer_name, remote_tp_size))
             call_id = len(calls)
             return ([call_id], [call_id + 10], [call_id + 20])
 
     fake_worker = FakeWorker()
+    fake_worker.world_size = 4
     fake_worker.kv_caches = kv_caches
     fake_worker.layer_name_to_local_kv_cache_metadata = {name: [] for name in kv_caches}
     writer = MoRIIOWriter.__new__(MoRIIOWriter)
@@ -371,6 +378,7 @@ def test_write_transfer_plan_caches_offsets_per_geometry():
             local_block_ids=[1, 3],
             request_id="req",
             transfer_id="xfer",
+            remote_tp_size=4,
         ),
         request_info,
         remote_meta,
@@ -381,6 +389,7 @@ def test_write_transfer_plan_caches_offsets_per_geometry():
             local_block_ids=[1, 3],
             request_id="req",
             transfer_id="xfer",
+            remote_tp_size=4,
         ),
         request_info,
         remote_meta,
@@ -391,12 +400,13 @@ def test_write_transfer_plan_caches_offsets_per_geometry():
             local_block_ids=[1, 3],
             request_id="req",
             transfer_id="xfer",
+            remote_tp_size=4,
         ),
         request_info,
         remote_meta,
     )
 
-    assert calls == ["dense0", "indexer"]
+    assert calls == [("dense0", 4), ("indexer", 4)]
     assert dense0_plan.transfer_local_offsets == [1]
     assert dense1_plan.transfer_local_offsets == [1]
     assert indexer_plan.transfer_local_offsets == [2]
@@ -418,6 +428,18 @@ def test_write_scheduler_deduplicates_layers_and_seals_expected_count():
 
     assert request_info.writes_expected == 2
     assert writer._sealed_writes["xfer"] == 2
+
+
+def test_write_completion_endpoint_maps_tp_and_wide_ep_per_request():
+    writer = _writer_with_fake_worker(SimpleNamespace(tp_rank=5, world_size=8))
+    task = _write_task("dense0")
+    task.remote_notify_port = 7000
+    task.remote_ip = "pod0"
+    task.remote_hosts = ("pod0", "pod1")
+    task.remote_dp_size_local = 8
+    task.remote_tp_size = 4
+
+    assert writer._resolve_write_completion_endpoint(task, 11) == ("pod1", 7014)
 
 
 def test_write_completion_notifies_once_after_all_sealed_writes_finish():
@@ -457,12 +479,9 @@ def test_write_completion_notifies_once_after_all_sealed_writes_finish():
     request_info = RemoteAllocInfo(block_ids=[4, 5], writes_expected=2)
     request_info.transfer_statuses.extend(["status-a", "status-b"])
     request_info.completion_request_id = "req"
-    request_info.completion_remote_notify_port = 7000
-    request_info.completion_remote_ip = "127.0.0.1"
+    request_info.completion_endpoints = (("127.0.0.1", 7002),)
     wrapper.done_remote_allocate_req_dict["xfer"] = request_info
-    writer = _writer_with_fake_worker(
-        SimpleNamespace(moriio_wrapper=wrapper, tp_rank=2)
-    )
+    writer = _writer_with_fake_worker(SimpleNamespace(moriio_wrapper=wrapper))
     writer._scheduled_writes["xfer"] = 2
     writer._scheduled_layers["xfer"] = {"dense0", "indexer"}
     writer._sealed_writes["xfer"] = 2

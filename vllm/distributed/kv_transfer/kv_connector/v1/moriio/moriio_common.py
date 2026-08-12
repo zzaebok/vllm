@@ -61,6 +61,8 @@ class WriteTask:
     remote_ip: str
     # Decode TP degree for completion-port addressing; 0 means homogeneous.
     remote_tp_size: int = 0
+    remote_dp_size_local: int = 0
+    remote_hosts: tuple[str, ...] = ()
     enqueue_time: float = field(default_factory=time.perf_counter)
     retried: int = 0
 
@@ -88,9 +90,7 @@ class RemoteAllocInfo:
     writes_expected: int | None = None
     decode_dp_rank: int = 0
     completion_request_id: str | None = None
-    completion_remote_notify_port: int | None = None
-    completion_remote_ip: str | None = None
-    completion_decode_tp_size: int = 0
+    completion_endpoints: tuple[tuple[str, int], ...] = ()
     completion_notified: bool = False
     transfer_statuses: list[Any] = field(default_factory=list)
     transfer_offsets: dict[

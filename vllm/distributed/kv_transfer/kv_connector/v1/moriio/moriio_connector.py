@@ -1275,6 +1275,8 @@ class MoRIIOConnectorWorker:
         remote_notify_port: int,
         remote_ip: str,
         remote_tp_size: int = 0,
+        remote_dp_size_local: int = 0,
+        remote_hosts: tuple[str, ...] = (),
     ) -> None:
         """Schedule a block write operation.
 
@@ -1289,6 +1291,8 @@ class MoRIIOConnectorWorker:
             remote_notify_port: Port for completion notification
             remote_ip: IP address of remote node
             remote_tp_size: Decode TP degree; 0 means assume homogeneous
+            remote_dp_size_local: Decode DP ranks per pod
+            remote_hosts: Decode hosts indexed by pod
         """
 
         # synchronization to prevent dirty reads between
@@ -1311,6 +1315,8 @@ class MoRIIOConnectorWorker:
             remote_notify_port=remote_notify_port,
             remote_ip=remote_ip,
             remote_tp_size=remote_tp_size,
+            remote_dp_size_local=remote_dp_size_local,
+            remote_hosts=remote_hosts,
         )
         self._writer.schedule_write(task)
 
@@ -2358,18 +2364,10 @@ class MoRIIOConnectorWorker:
         )
 
     def _write_blocks_for_req(self, req_id: ReqId, meta: ReqMeta, layer_name, kv_layer):
-        # Stash multi_pod_hosts + local DP size on the worker so
-        # MoRIIOEngine._finalize_if_complete (which sees only the WriteTask,
-        # not ReqMeta) can pick the per-rank pod IP for the completion notify.
-        # Last-writer-wins is safe: all requests share the same topology.
-        if meta.multi_pod_hosts:
-            self.multi_pod_hosts = list(meta.multi_pod_hosts)
-        else:
-            self.multi_pod_hosts = [meta.remote_host]
-        if meta.remote_dp_size_local:
-            self.remote_dp_size_local = int(meta.remote_dp_size_local)
-        else:
-            self.remote_dp_size_local = int(meta.remote_dp_size)
+        remote_tp_size = int(meta.tp_size) or self.world_size
+        remote_dp_size_local = int(meta.remote_dp_size_local) or int(
+            meta.remote_dp_size
+        )
         self.schedule_write_blocks(
             request_id=req_id,
             transfer_id=meta.transfer_id,
@@ -2380,7 +2378,9 @@ class MoRIIOConnectorWorker:
             kv_layer=kv_layer,
             remote_notify_port=meta.remote_notify_port,
             remote_ip=meta.remote_host,
-            remote_tp_size=int(meta.tp_size),
+            remote_tp_size=remote_tp_size,
+            remote_dp_size_local=remote_dp_size_local,
+            remote_hosts=tuple(meta.multi_pod_hosts or [meta.remote_host]),
         )
 
     def merge_contiguous_blocks(

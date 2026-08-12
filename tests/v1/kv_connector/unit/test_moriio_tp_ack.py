@@ -183,6 +183,57 @@ def test_write_done_uses_per_request_decode_tp_size():
     ]
 
 
+def test_write_completion_maps_producer_tp_to_decode_pod_and_port():
+    writer = MoRIIOWriter.__new__(MoRIIOWriter)
+    writer._worker_ref = lambda: SimpleNamespace(tp_rank=5, world_size=8)
+    task = SimpleNamespace(
+        remote_tp_size=4,
+        remote_ip="pod0",
+        remote_hosts=("pod0", "pod1"),
+        remote_notify_port=7000,
+        remote_dp_size_local=8,
+    )
+
+    assert writer._resolve_write_completion_endpoint(task, 11) == ("pod1", 7014)
+
+
+def test_write_tasks_keep_each_requests_decode_topology():
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 8
+    scheduled = []
+    worker.schedule_write_blocks = lambda **kwargs: scheduled.append(kwargs)
+
+    def meta(host, tp_size, dp_local, hosts):
+        return SimpleNamespace(
+            transfer_id=f"tx-{host}",
+            remote_engine_id=f"engine-{host}",
+            local_block_ids=[1],
+            remote_block_ids=[2],
+            remote_notify_port=7000,
+            remote_host=host,
+            tp_size=tp_size,
+            remote_dp_size=dp_local,
+            remote_dp_size_local=dp_local,
+            multi_pod_hosts=hosts,
+        )
+
+    worker._write_blocks_for_req(
+        "req-a", meta("host-a", 2, 4, ["a0", "a1"]), "layer", object()
+    )
+    worker._write_blocks_for_req(
+        "req-b", meta("host-b", 8, 2, ["b0"]), "layer", object()
+    )
+
+    assert [task["remote_tp_size"] for task in scheduled] == [2, 8]
+    assert [task["remote_dp_size_local"] for task in scheduled] == [4, 2]
+    assert [task["remote_hosts"] for task in scheduled] == [
+        ("a0", "a1"),
+        ("b0",),
+    ]
+    assert not hasattr(worker, "multi_pod_hosts")
+    assert not hasattr(worker, "remote_dp_size_local")
+
+
 def test_advertised_notify_port_remains_the_cluster_base(monkeypatch):
     monkeypatch.setattr(moriio_common, "get_tensor_model_parallel_rank", lambda: 1)
     monkeypatch.setattr(
