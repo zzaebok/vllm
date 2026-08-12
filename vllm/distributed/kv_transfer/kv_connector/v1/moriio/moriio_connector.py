@@ -39,6 +39,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     WriteTask,
     fold_local_rank,
     get_moriio_mode,
+    get_moriio_notification_endpoint,
     get_moriio_remote_tp_rank,
     get_peer_zmq_from_request_id,
     get_port_offset,
@@ -536,6 +537,57 @@ class MoRIIOConnectorScheduler:
                 }
             )
         )
+
+    @staticmethod
+    def _resolve_remote_notify_base(
+        request_id: ReqId, params: dict[str, Any]
+    ) -> tuple[str, int]:
+        peer_zmq = get_peer_zmq_from_request_id(request_id, is_producer=False)
+        if peer_zmq is not None:
+            remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
+            return remote_host, int(remote_notify_port)
+
+        raw_host = params.get("remote_host")
+        raw_notify_port = params.get("remote_notify_port")
+        if (
+            raw_host is None
+            or raw_host == ""
+            or raw_notify_port is None
+            or raw_notify_port == ""
+        ):
+            raise ValueError(
+                f"request {request_id!r} has no explicit or embedded peer "
+                "notify address"
+            )
+        return str(raw_host), int(raw_notify_port)
+
+    def _prefill_notify_endpoints(
+        self, request_id: ReqId, params: dict[str, Any]
+    ) -> list[tuple[str, int]]:
+        remote_host, remote_notify_port = self._resolve_remote_notify_base(
+            request_id, params
+        )
+        producer_tp_size = resolve_peer_tp_size(params, self.tp_size)
+        remote_dp_rank = int(params.get("remote_dp_rank", 0) or 0)
+        remote_dp_size = int(params.get("remote_dp_size", 1) or 1)
+        remote_dp_size_local = int(
+            params.get("remote_dp_size_local", 0) or remote_dp_size
+        )
+        remote_hosts = params.get("remote_hosts") or []
+        if isinstance(remote_hosts, str):
+            remote_hosts = [remote_hosts]
+        return [
+            get_moriio_notification_endpoint(
+                remote_host,
+                remote_hosts,
+                remote_notify_port,
+                remote_dp_rank,
+                remote_dp_size_local,
+                producer_tp_rank,
+                producer_tp_size,
+            )
+            for producer_tp_rank in range(producer_tp_size)
+        ]
 
     def _release_write_prefill_blocks(self, request_id: ReqId, params: dict[str, Any]):
         transfer_id = params.get("transfer_id")

@@ -7,6 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio import moriio_common
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
+    moriio_connector as moriio_connector_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOMode,
     MoRIIOTransferAck,
@@ -206,6 +209,36 @@ def test_advertised_notify_port_remains_the_cluster_base(monkeypatch):
 
     assert config.notify_port == 7003
     assert config.base_notify_port == 7000
+    assert moriio_common.get_moriio_notification_endpoint(
+        "127.0.0.1", [], config.base_notify_port, 1, 2, 1, 2
+    ) == ("127.0.0.1", config.notify_port)
+    assert moriio_common.get_moriio_notification_endpoint(
+        "127.0.0.1", [], config.notify_port, 1, 2, 1, 2
+    ) == ("127.0.0.1", 7006)
+
+
+def test_prefill_notify_endpoints_cover_the_producer_width(monkeypatch):
+    monkeypatch.setattr(
+        moriio_connector_module,
+        "get_peer_zmq_from_request_id",
+        lambda *args, **kwargs: None,
+    )
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.tp_size = 4
+
+    endpoints = scheduler._prefill_notify_endpoints(
+        "req",
+        {
+            "remote_host": "10.0.0.1",
+            "remote_notify_port": 7000,
+            "remote_tp_size": 8,
+            "remote_dp_rank": 1,
+            "remote_dp_size": 2,
+            "remote_dp_size_local": 2,
+        },
+    )
+
+    assert endpoints == [("10.0.0.1", port) for port in range(7008, 7016)]
 
 
 def test_remote_tp_rank_p4_d8_floor_maps_decode_to_prefill():

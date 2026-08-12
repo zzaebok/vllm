@@ -4,7 +4,7 @@ import contextlib
 import os
 import threading
 import time
-from collections.abc import Iterator, Mapping
+from collections.abc import Collection, Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -259,6 +259,35 @@ def pod_index(global_dp_rank: int, dp_size_local: int) -> int:
     ``dp_size_local == 0`` (external-DP sentinel) collapses to a single pod.
     """
     return global_dp_rank // dp_size_local if dp_size_local else 0
+
+
+def get_moriio_notification_endpoint(
+    remote_host: str,
+    remote_hosts: Collection[str],
+    base_port: int,
+    remote_dp_rank: int,
+    remote_dp_size_local: int,
+    remote_tp_rank: int,
+    remote_tp_size: int,
+) -> tuple[str, int]:
+    if remote_tp_size <= 0:
+        raise ValueError("remote_tp_size must be positive")
+    if remote_tp_rank < 0 or remote_tp_rank >= remote_tp_size:
+        raise ValueError(
+            f"remote_tp_rank {remote_tp_rank} must be in [0, {remote_tp_size})"
+        )
+
+    local_dp_rank = fold_local_rank(remote_dp_rank, remote_dp_size_local)
+    notify_host = remote_host
+    hosts = list(remote_hosts)
+    if hosts and remote_dp_size_local > 0:
+        remote_pod = pod_index(remote_dp_rank, remote_dp_size_local)
+        if 0 <= remote_pod < len(hosts):
+            notify_host = hosts[remote_pod]
+    notify_port = int(base_port) + get_port_offset(
+        local_dp_rank, remote_tp_rank, remote_tp_size
+    )
+    return notify_host, notify_port
 
 
 def resolve_host_ip(extra_config: dict) -> str:
