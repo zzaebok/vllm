@@ -589,12 +589,11 @@ class MoRIIOConnectorScheduler:
             for producer_tp_rank in range(producer_tp_size)
         ]
 
-    def _release_write_prefill_blocks(self, request_id: ReqId, params: dict[str, Any]):
+    def _release_prefill_blocks(self, request_id: ReqId, params: dict[str, Any]):
         transfer_id = params.get("transfer_id")
         if transfer_id is None:
             logger.warning(
-                "Cannot release WRITE prefill blocks for request %s: "
-                "missing transfer_id",
+                "Cannot release prefill blocks for request %s: missing transfer_id",
                 request_id,
             )
             return
@@ -610,7 +609,7 @@ class MoRIIOConnectorScheduler:
                 remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
             except ValueError:
                 logger.warning(
-                    "Cannot release WRITE prefill blocks for request %s: "
+                    "Cannot release prefill blocks for request %s: "
                     "missing remote notify address",
                     request_id,
                 )
@@ -684,23 +683,13 @@ class MoRIIOConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             if self.mode == MoRIIOMode.READ:
                 if remote_block_ids := params.get("remote_block_ids"):
-                    # remote_engine_id is returned by the prefill's request_finished.
-                    # host/ports come from the request_id (parsed in add_new_req).
-                    if "remote_engine_id" in params:
-                        if num_external_tokens > 0:
-                            # Get unhashed blocks to pull from remote.
-                            local_block_ids = blocks.get_block_ids()[0]
-                            assert len(local_block_ids) <= len(remote_block_ids)
-                            if len(local_block_ids) != len(remote_block_ids):
-                                local_block_ids = remote_block_ids[
-                                    -len(local_block_ids) :
-                                ]
-                        else:
-                            # If remote_blocks and num_external_tokens = 0, we have
-                            # a full prefix cache hit on the D worker. We need to call
-                            # send_notify in _read_blocks to free the memory on the P.
-                            local_block_ids = []
-
+                    if num_external_tokens == 0:
+                        self._release_prefill_blocks(request.request_id, params)
+                    elif "remote_engine_id" in params:
+                        local_block_ids = blocks.get_block_ids()[0]
+                        assert len(local_block_ids) <= len(remote_block_ids)
+                        if len(local_block_ids) != len(remote_block_ids):
+                            local_block_ids = remote_block_ids[-len(local_block_ids) :]
                         self._reqs_need_recv[request.request_id] = (
                             request,
                             local_block_ids,
@@ -962,16 +951,7 @@ class MoRIIOConnectorScheduler:
             # If do_remote_prefill is still True when the request is finished,
             # update_state_after_alloc must not have been called (the request
             # must have been aborted before it was scheduled).
-            # To avoid stranding the prefill blocks in the prefill instance,
-            # READ mode adds empty block_ids to _reqs_need_recv so the worker
-            # side notifies the prefill instance. WRITE mode should notify the
-            # producer directly: there is no decode allocation for the producer
-            # to write into, and a plain request_id may not contain router-
-            # embedded MoRIIO ZMQ addresses.
-            if self.mode == MoRIIOMode.WRITE:
-                self._release_write_prefill_blocks(request.request_id, params)
-            else:
-                self._reqs_need_recv[request.request_id] = (request, [])
+            self._release_prefill_blocks(request.request_id, params)
             params["do_remote_prefill"] = False
             return False, None
 

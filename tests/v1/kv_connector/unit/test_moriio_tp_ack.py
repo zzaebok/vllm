@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
     MoRIIOWriter,
 )
+from vllm.v1.request import RequestStatus
 
 
 def test_remote_tp_rank_same_tp_maps_to_self():
@@ -65,13 +66,13 @@ def test_resolve_peer_tp_size_falls_back_when_unadvertised():
     assert resolve_peer_tp_size({"remote_tp_size": 8, "tp_size": 2}, 4) == 8
 
 
-def test_early_write_release_uses_producer_tp_size():
+def test_early_prefill_release_uses_producer_tp_size():
     scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
     scheduler.tp_size = 4
     sent = []
     scheduler._send_transfer_release = lambda *args: sent.append(args)
 
-    scheduler._release_write_prefill_blocks(
+    scheduler._release_prefill_blocks(
         "req",
         {
             "transfer_id": "tx",
@@ -239,6 +240,65 @@ def test_prefill_notify_endpoints_cover_the_producer_width(monkeypatch):
     )
 
     assert endpoints == [("10.0.0.1", port) for port in range(7008, 7016)]
+
+
+def test_read_zero_transfer_releases_without_worker_metadata():
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.mode = MoRIIOMode.READ
+    scheduler.is_producer = False
+    scheduler.tp_size = 2
+    scheduler._reqs_need_recv = {}
+    scheduler._reqs_need_save = {}
+    scheduler._req_kv_params = {}
+    scheduler.map_request_id = lambda request_id, transfer_id: None
+    releases = []
+    scheduler._release_prefill_blocks = lambda request_id, params: releases.append(
+        (request_id, params["transfer_id"])
+    )
+    params = {
+        "do_remote_prefill": True,
+        "transfer_id": "tx-hit",
+        "remote_block_ids": [7, 8],
+        "remote_host": "127.0.0.1",
+        "remote_notify_port": 7000,
+        "remote_tp_size": 2,
+    }
+    request = SimpleNamespace(request_id="req-hit", kv_transfer_params=params)
+    blocks = SimpleNamespace(get_block_ids=lambda: [[1, 2]])
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    assert releases == [("req-hit", "tx-hit")]
+    assert scheduler._reqs_need_recv == {}
+    assert scheduler._req_kv_params == {}
+    assert params["do_remote_prefill"] is False
+
+
+def test_read_abort_before_allocation_releases_without_worker_metadata():
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.mode = MoRIIOMode.READ
+    scheduler.is_producer = False
+    scheduler._reqs_need_recv = {}
+    scheduler.unmap_request_id = lambda request_id, transfer_id=None: None
+    releases = []
+    scheduler._release_prefill_blocks = lambda request_id, params: releases.append(
+        (request_id, params["transfer_id"])
+    )
+    params = {
+        "do_remote_prefill": True,
+        "transfer_id": "tx-abort",
+        "remote_block_ids": [7, 8],
+    }
+    request = SimpleNamespace(
+        request_id="req-abort",
+        kv_transfer_params=params,
+        status=RequestStatus.FINISHED_ABORTED,
+    )
+
+    assert scheduler.request_finished(request, []) == (False, None)
+    assert releases == [("req-abort", "tx-abort")]
+    assert scheduler._reqs_need_recv == {}
+    assert params["do_remote_prefill"] is False
 
 
 def test_remote_tp_rank_p4_d8_floor_maps_decode_to_prefill():
