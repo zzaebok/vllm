@@ -6,7 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio import (
+    moriio_connector as moriio_connector_module,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+    HandshakeError,
+    MoRIIOAgentMetadata,
     MoRIIOMode,
     MoRIIOTransferAck,
 )
@@ -350,6 +355,116 @@ def test_aborted_write_transfer_is_terminal_and_releases_producer_state():
     assert "tx" not in writer._scheduled_writes
     assert "tx" not in writer._scheduled_layers
     assert "tx" not in writer._sealed_writes
+
+
+def test_handshake_receive_has_a_real_socket_deadline(monkeypatch):
+    class TimeoutSocket:
+        def __init__(self):
+            self.options = {}
+
+        def send(self, payload):
+            pass
+
+        def setsockopt(self, option, value):
+            self.options[option] = value
+
+        def recv_multipart(self):
+            raise moriio_connector_module.zmq.Again()
+
+    class SocketContext:
+        def __init__(self, sock):
+            self.sock = sock
+
+        def __enter__(self):
+            return self.sock
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 1
+    worker.tp_rank = 0
+    worker.moriio_config = SimpleNamespace(transfer_timeout=0.05)
+    sock = TimeoutSocket()
+    monkeypatch.setattr(
+        moriio_connector_module,
+        "zmq_ctx",
+        lambda socket_type, path: SocketContext(sock),
+    )
+
+    with pytest.raises(HandshakeError, match="receiving agent metadata"):
+        worker._moriio_handshake("127.0.0.1", 6301, 1, "engine_dp0")
+
+    timeout_ms = sock.options[moriio_connector_module.zmq.RCVTIMEO]
+    assert 1 <= timeout_ms <= 50
+
+
+def test_partial_handshake_does_not_register_remote_engine(monkeypatch):
+    metadata = MoRIIOAgentMetadata(
+        engine_id="remote",
+        agent_metadata=b"agent",
+        kv_caches_base_addr=[0],
+        num_blocks=1,
+        block_len=1,
+        attn_backend_name="test",
+    )
+    first_frame = [
+        b"",
+        moriio_connector_module.msgspec.msgpack.encode(metadata),
+    ]
+
+    class PartialSocket:
+        def __init__(self):
+            self.frames = [first_frame]
+
+        def send(self, payload):
+            pass
+
+        def setsockopt(self, option, value):
+            pass
+
+        def recv_multipart(self):
+            if self.frames:
+                return self.frames.pop(0)
+            raise moriio_connector_module.zmq.Again()
+
+    class SocketContext:
+        def __enter__(self):
+            return PartialSocket()
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeWrapper:
+        def __init__(self):
+            self.registered = []
+
+        def register_remote_engine(self, agent_metadata):
+            self.registered.append(agent_metadata)
+            return "agent-name"
+
+        def shutdown(self):
+            pass
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.world_size = 1
+    worker.tp_rank = 0
+    worker.moriio_config = SimpleNamespace(transfer_timeout=0.05)
+    worker.moriio_wrapper = FakeWrapper()
+    worker.local_kv_cache_metadata = []
+    worker.remote_kv_cache_metadata = []
+    worker.layer_name_to_remote_kv_cache_metadata = {}
+    worker.remote_moriio_metadata = {}
+    monkeypatch.setattr(
+        moriio_connector_module,
+        "zmq_ctx",
+        lambda socket_type, path: SocketContext(),
+    )
+
+    with pytest.raises(HandshakeError, match="receiving KV-cache metadata"):
+        worker._moriio_handshake("127.0.0.1", 6301, 1, "engine_dp0")
+
+    assert worker.moriio_wrapper.registered == []
 
 
 @pytest.mark.parametrize("task_source", ["queued", "deferred"])

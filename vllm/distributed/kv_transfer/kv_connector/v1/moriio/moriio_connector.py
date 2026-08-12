@@ -1513,6 +1513,7 @@ class MoRIIOConnectorWorker:
         expected_engine_id: str,
         remote_dp_rank: int = 0,
         remote_tp_rank: int | None = None,
+        deadline: float | None = None,
     ) -> set[str]:
         """Do a MoRIIO handshake with a remote instance.
 
@@ -1524,6 +1525,8 @@ class MoRIIOConnectorWorker:
         """
 
         start_time = time.perf_counter()
+        if deadline is None:
+            deadline = time.monotonic() + self.moriio_config.transfer_timeout
 
         # NOTE(rob): we need each rank to have a unique port. This is
         # a hack to keep us moving. We will switch when moving to etcd
@@ -1540,9 +1543,21 @@ class MoRIIOConnectorWorker:
 
         # Send query for the request.
         with zmq_ctx(zmq.DEALER, path) as sock:
+
+            def recv_frame(stage: str) -> list[bytes]:
+                remaining_ms = max(1, math.ceil((deadline - time.monotonic()) * 1000))
+                sock.setsockopt(zmq.RCVTIMEO, remaining_ms)
+                try:
+                    return sock.recv_multipart()
+                except zmq.Again as e:
+                    raise HandshakeError(
+                        f"MoRIIO handshake with {path} timed out while "
+                        f"receiving {stage}"
+                    ) from e
+
             logger.debug("prepare send msg INSTAZNCE: %s", path)
             sock.send(MoRIIOConstants.GET_META_MSG)
-            received_frame = sock.recv_multipart()
+            received_frame = recv_frame("agent metadata")
             if len(received_frame) != 2 or received_frame[0] != b"":
                 raise HandshakeError(f"Unexpected frame! {received_frame = }")
 
@@ -1553,19 +1568,6 @@ class MoRIIOConnectorWorker:
             logger.info(
                 "MoRIIO handshake: get metadata took: %s",
                 got_metadata_time - start_time,
-            )
-
-            self.moriio_wrapper.remote_engine_ip = host
-            remote_agent_name = self.moriio_wrapper.register_remote_engine(
-                metadata.agent_metadata
-            )
-
-            logger.debug(
-                "MoRIIO handshake: registered"
-                "remote agent %s for engine ID %s, path = %s",
-                remote_agent_name,
-                expected_engine_id,
-                path,
             )
 
             if len(self.local_kv_cache_metadata) > 0:
@@ -1583,12 +1585,26 @@ class MoRIIOConnectorWorker:
                 )
                 self.remote_kv_cache_metadata = []
 
-            received_frame = sock.recv_multipart()
+            received_frame = recv_frame("KV-cache metadata")
             if len(received_frame) != 2 or received_frame[0] != b"":
                 raise HandshakeError(f"unexpected frame! {received_frame = }")
             buf = received_frame[1]
+            remote_kv_cache_metadata = msgpack.loads(buf)
+
+            self.moriio_wrapper.remote_engine_ip = host
+            remote_agent_name = self.moriio_wrapper.register_remote_engine(
+                metadata.agent_metadata
+            )
+            logger.debug(
+                "MoRIIO handshake: registered"
+                "remote agent %s for engine ID %s, path = %s",
+                remote_agent_name,
+                expected_engine_id,
+                path,
+            )
+
             self.layer_name_to_remote_kv_cache_metadata[expected_engine_id] = (
-                msgpack.loads(buf)
+                remote_kv_cache_metadata
             )
             self.remote_moriio_metadata[expected_engine_id] = metadata
             setup_agent_time = time.perf_counter()
