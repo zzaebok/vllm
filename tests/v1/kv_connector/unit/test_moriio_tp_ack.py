@@ -265,6 +265,8 @@ def test_worker_get_finished_counts_structured_release_fan_in():
 
 
 def test_read_completion_sends_structured_release_with_consumer_tp_size():
+    from types import SimpleNamespace
+
     class DoneStatus:
         def Succeeded(self):
             return True
@@ -292,6 +294,7 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
 
     worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
     worker.world_size = 8
+    worker.moriio_config = SimpleNamespace(transfer_timeout=5.0)
     worker.moriio_wrapper = FakeWrapper()
     worker._recving_transfers = {"req": {"layer0": DoneStatus()}}
     worker._recving_transfers_callback_addr = {
@@ -299,6 +302,9 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     }
     # Transfer-timeout reaping state consulted by _pop_done_transfers.
     worker._recving_transfers_start = {}
+    worker._recving_block_ids = {"req": {0}}
+    worker._invalid_block_ids = set()
+    worker._unsynchronized_read_requests = set()
 
     assert worker._pop_done_transfers() == {"tx-release"}
     assert worker.moriio_wrapper.sent == [
@@ -320,3 +326,176 @@ def test_read_mode_requires_piecewise_cudagraphs():
     assert (
         MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": False}) is False
     )
+
+
+class _Status:
+    """Minimal stand-in for a MoRIIO transfer status handle."""
+
+    def __init__(self, succeeded=False, failed=False, message="", code=0):
+        self._succeeded = succeeded
+        self._failed = failed
+        self._message = message
+        self._code = code
+
+    def Succeeded(self):
+        return self._succeeded
+
+    def Failed(self):
+        return self._failed
+
+    def Message(self):
+        return self._message
+
+    def Code(self):
+        return self._code
+
+
+class _RecordingWrapper:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.sent = []
+
+    def send_notify(
+        self, transfer_id, host, port, message_type=None, message_fields=None
+    ):
+        self.sent.append((transfer_id, message_type))
+
+    def shutdown(self):
+        pass
+
+
+def _read_worker(status_list, wrapper=None, block_ids=(10, 11)):
+    from types import SimpleNamespace
+
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.is_producer = False
+    worker.mode = MoRIIOMode.READ
+    worker.world_size = 2
+    worker.moriio_config = SimpleNamespace(transfer_timeout=5.0)
+    worker.moriio_wrapper = wrapper or _RecordingWrapper()
+    # One status per layer, matching how _read_blocks registers transfers.
+    worker._recving_transfers = {
+        "req": {f"layer{i}": status for i, status in enumerate(status_list)}
+    }
+    worker._recving_transfers_callback_addr = {"req": ("127.0.0.1", "7000", "tx-read")}
+    worker._recving_transfers_start = {}
+    worker._recving_block_ids = {"req": set(block_ids)}
+    worker._invalid_block_ids = set()
+    worker._unsynchronized_read_requests = set()
+    worker.transfer_id_to_request_id = {"tx-read": "req"}
+    return worker
+
+
+def test_read_failure_releases_and_reports_its_blocks_as_invalid():
+    """A failed layer frees prefill's blocks and invalidates the decode blocks.
+
+    Synchronous READ requests are already RUNNING, so get_finished() must not
+    report them as asynchronous completions. The invalid IDs in the same worker
+    pass make the scheduler discard this step's output and recompute the blocks.
+    """
+    worker = _read_worker(
+        [_Status(succeeded=True), _Status(failed=True, message="io", code=7)],
+        block_ids=(10, 11),
+    )
+
+    assert worker.get_finished() == (set(), set())
+    assert worker.moriio_wrapper.sent == [("tx-read", "release")]
+    assert worker._recving_transfers == {}
+    assert worker.get_block_ids_with_load_errors() == {10, 11}
+
+
+def test_successful_read_reports_no_invalid_blocks():
+    worker = _read_worker([_Status(succeeded=True), _Status(succeeded=True)])
+
+    assert worker.get_finished() == (set(), set())
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_invalid_block_ids_are_drained_once():
+    """The scheduler must not see the same bad block twice."""
+    worker = _read_worker([_Status(failed=True, message="io", code=7)], block_ids=(3,))
+    worker.get_finished()
+
+    assert worker.get_block_ids_with_load_errors() == {3}
+    assert worker.get_block_ids_with_load_errors() == set()
+
+
+def test_read_failure_waits_for_every_layer_before_invalidating(monkeypatch):
+    """A block cannot be reused while another layer may still DMA into it."""
+    pending = _Status()
+    worker = _read_worker(
+        [_Status(failed=True, message="io", code=7), pending],
+        block_ids=(3,),
+    )
+    worker._recving_transfers_start = {"req": 0.0}
+    sleep_calls = []
+
+    def finish_pending_layer(delay):
+        sleep_calls.append(delay)
+        pending._succeeded = True
+
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio."
+        "moriio_connector.time.sleep",
+        finish_pending_layer,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio."
+        "moriio_connector.time.monotonic",
+        lambda: 1.0,
+    )
+
+    worker.get_finished()
+
+    assert sleep_calls == [0.001]
+    assert worker.get_block_ids_with_load_errors() == {3}
+    assert worker.moriio_wrapper.sent == [("tx-read", "release")]
+
+
+def test_read_barrier_timeout_invalidates_even_if_rdma_later_succeeds(monkeypatch):
+    """A late Success cannot validate KV that attention may already have read."""
+    from types import SimpleNamespace
+
+    from vllm.config import CUDAGraphMode
+
+    pending = _Status()
+    worker = _read_worker([pending], block_ids=(3,))
+    monotonic_values = iter((0.0, 6.0, 6.0))
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio."
+        "moriio_connector.get_forward_context",
+        lambda: SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.NONE),
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio."
+        "moriio_connector.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+
+    worker.wait_for_layer_load("layer0")
+    pending._succeeded = True
+    worker.get_finished()
+
+    assert worker.get_block_ids_with_load_errors() == {3}
+    assert worker.moriio_wrapper.sent == [("tx-read", "release")]
+
+
+def test_read_timeout_fails_closed_without_releasing_live_dma(monkeypatch):
+    from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
+        TransferError,
+    )
+
+    worker = _read_worker([_Status()], block_ids=(3,))
+    worker._recving_transfers_start = {"req": 0.0}
+    monkeypatch.setattr(
+        "vllm.distributed.kv_transfer.kv_connector.v1.moriio."
+        "moriio_connector.time.monotonic",
+        lambda: 6.0,
+    )
+
+    with pytest.raises(TransferError, match="cannot be safely cancelled"):
+        worker.get_finished()
+
+    assert worker._recving_transfers
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert worker.moriio_wrapper.sent == []

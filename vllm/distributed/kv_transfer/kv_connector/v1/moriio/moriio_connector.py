@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
 import math
-import os
 import queue
 import threading
 import time
@@ -193,6 +192,7 @@ def resolve_moriio_transfer_ack(
 class MoRIIOConnector(KVConnectorBase_V1):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        """READ barriers must execute between attention-layer graph pieces."""
         return str(extra_config.get("read_mode", "false")).lower().strip() in (
             "true",
             "1",
@@ -307,6 +307,10 @@ class MoRIIOConnector(KVConnectorBase_V1):
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
         return self.connector_worker.get_finished()
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
@@ -1249,9 +1253,15 @@ class MoRIIOConnectorWorker:
         # Values are (remote_host, remote_notify_port, transfer_id).
         self._recving_transfers_callback_addr: dict[ReqId, tuple[str, str, str]] = {}
         # Monotonic-clock start times for each in-flight recv transfer.
-        # Used by _pop_done_transfers to abort transfers whose RDMA
-        # completion is lost, instead of hanging forever.
+        # Used by _pop_done_transfers to bound the terminal-status wait.
         self._recving_transfers_start: dict[str, float] = {}
+        # Local blocks each in-flight READ is filling, so a failed transfer
+        # can report exactly which blocks are now partial.
+        self._recving_block_ids: dict[ReqId, set[int]] = {}
+        self._invalid_block_ids: set[int] = set()
+        # Requests whose layer barrier did not observe terminal RDMA before
+        # attention used the destination. Even an eventual Success is invalid.
+        self._unsynchronized_read_requests: set[ReqId] = set()
 
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
@@ -1933,38 +1943,76 @@ class MoRIIOConnectorWorker:
         deadline = time.monotonic() + self.moriio_config.transfer_timeout
         while True:
             with self.moriio_wrapper.lock:
-                pending = [
-                    status_by_layer[layer_name]
-                    for status_by_layer in self._recving_transfers.values()
+                pending = {
+                    req_id: status_by_layer[layer_name]
+                    for req_id, status_by_layer in self._recving_transfers.items()
                     if layer_name in status_by_layer
-                ]
+                }
 
             if not pending:
                 return
 
-            still_running = False
-            for status in pending:
-                # A failed read is dropped in _pop_done_transfers.
-                if status.Succeeded() or status.Failed():
-                    continue
-                still_running = True
+            still_running_req_ids = {
+                req_id
+                for req_id, status in pending.items()
+                if not status.Succeeded() and not status.Failed()
+            }
 
-            if not still_running:
+            if not still_running_req_ids:
                 return
 
             if time.monotonic() > deadline:
+                with self.moriio_wrapper.lock:
+                    self._unsynchronized_read_requests.update(still_running_req_ids)
                 logger.warning(
-                    "MoRIIO READ barrier timed out for layer %s; proceeding "
-                    "(request dropped via get_finished).",
+                    "MoRIIO READ barrier timed out for layer %s and requests %s; "
+                    "their blocks will be invalidated after all RDMA is terminal.",
                     layer_name,
+                    sorted(still_running_req_ids),
                 )
                 return
 
             time.sleep(0.001)
 
     def _pop_done_transfers(self) -> set[str]:
+        transfer_timeout = self.moriio_config.transfer_timeout
+
+        # READ loads are synchronous from the scheduler's perspective. Do not
+        # return a model output while a layer can still become Failed(), and do
+        # not invalidate/reuse its destination blocks while another layer may
+        # still DMA into them. This connector has no cancellation/drain path, so
+        # an unresponsive transfer must fail the step instead of being reaped.
+        while True:
+            now = time.monotonic()
+            with self.moriio_wrapper.lock:
+                pending_req_ids = {
+                    req_id
+                    for req_id, status_by_layer in self._recving_transfers.items()
+                    if status_by_layer
+                    and any(
+                        not status.Succeeded() and not status.Failed()
+                        for status in status_by_layer.values()
+                    )
+                }
+                expired_req_ids = {
+                    req_id
+                    for req_id in pending_req_ids
+                    if now - self._recving_transfers_start.setdefault(req_id, now)
+                    >= transfer_timeout
+                }
+
+            if expired_req_ids:
+                raise TransferError(
+                    "MoRIIO READ timed out before all layer transfers became "
+                    f"terminal for requests {sorted(expired_req_ids)} after "
+                    f"{transfer_timeout:.1f}s. The transfers cannot be safely "
+                    "cancelled or their destination blocks reused."
+                )
+            if not pending_req_ids:
+                break
+            time.sleep(0.001)
+
         done_req_ids: set[str] = set()
-        _xfer_timeout = int(os.environ.get("VLLM_MORIIO_TRANSFER_TIMEOUT_S", "120"))
         with self.moriio_wrapper.lock:
             to_remove = []
             for req_id, status_by_layer in self._recving_transfers.items():
@@ -1972,7 +2020,12 @@ class MoRIIOConnectorWorker:
                 failed_status = next(
                     (status for status in statuses if status.Failed()), None
                 )
-                if statuses and all(status.Succeeded() for status in statuses):
+                unsynchronized = req_id in self._unsynchronized_read_requests
+                if (
+                    statuses
+                    and all(status.Succeeded() for status in statuses)
+                    and not unsynchronized
+                ):
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     done_req_ids.add(xfer_id)
                     self.moriio_wrapper.send_notify(
@@ -1983,15 +2036,22 @@ class MoRIIOConnectorWorker:
                         message_fields={"consumer_tp_size": self.world_size},
                     )
                     to_remove.append(req_id)
-                elif failed_status is not None:
-                    logger.error(
-                        "RDMA transfer failed for request %s: %s (code=%s). "
-                        "Notifying prefill to free blocks; request will be "
-                        "aborted by timeout.",
-                        req_id,
-                        failed_status.Message(),
-                        failed_status.Code(),
-                    )
+                elif failed_status is not None or unsynchronized:
+                    if failed_status is not None:
+                        logger.error(
+                            "RDMA transfer failed for request %s: %s (code=%s). "
+                            "Notifying prefill to free blocks; reporting the "
+                            "request's blocks as invalid.",
+                            req_id,
+                            failed_status.Message(),
+                            failed_status.Code(),
+                        )
+                    else:
+                        logger.error(
+                            "RDMA completed after request %s passed its layer "
+                            "barrier; reporting its blocks as invalid.",
+                            req_id,
+                        )
                     host, port, xfer_id = self._recving_transfers_callback_addr[req_id]
                     try:
                         self.moriio_wrapper.send_notify(
@@ -2006,30 +2066,27 @@ class MoRIIOConnectorWorker:
                             "Failed to send error notification for request %s",
                             req_id,
                         )
+                    # The KV in these blocks is partially written. Surface
+                    # them so the scheduler invalidates them rather than
+                    # serving from a half-filled cache.
+                    self._invalid_block_ids.update(
+                        self._recving_block_ids.get(req_id, ())
+                    )
                     to_remove.append(req_id)
-                    # Do NOT add to done_req_ids: decode KV cache is incomplete.
-                    # The request will expire via the normal request timeout.
-                elif req_id in self._recving_transfers_start:
-                    # Abort still-in-flight transfers that exceed the
-                    # configured deadline. Otherwise a lost RDMA
-                    # completion would leave the decode worker hung
-                    # indefinitely on this request.
-                    _age = time.monotonic() - self._recving_transfers_start[req_id]
-                    if _age > _xfer_timeout:
-                        logger.error(
-                            "RDMA read TIMED OUT for req %s after %.1fs "
-                            "(VLLM_MORIIO_TRANSFER_TIMEOUT_S=%d)",
-                            req_id,
-                            _age,
-                            _xfer_timeout,
-                        )
-                        to_remove.append(req_id)
             for req_id in to_remove:
                 del self._recving_transfers[req_id]
                 del self._recving_transfers_callback_addr[req_id]
                 self._recving_transfers_start.pop(req_id, None)
+                self._recving_block_ids.pop(req_id, None)
+                self._unsynchronized_read_requests.discard(req_id)
 
             return done_req_ids
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """Blocks whose READ did not fully land, drained once per call."""
+        invalid_block_ids = self._invalid_block_ids
+        self._invalid_block_ids = set()
+        return invalid_block_ids
 
     def save_kv_layer(
         self,
@@ -2634,6 +2691,9 @@ class MoRIIOConnectorWorker:
             with self.moriio_wrapper.lock:
                 self._recving_transfers[request_id][layer_name] = transfer_status
                 self._recving_transfers_start.setdefault(request_id, time.monotonic())
+                self._recving_block_ids.setdefault(request_id, set()).update(
+                    local_block_ids
+                )
                 self._recving_transfers_callback_addr[request_id] = (
                     remote_host,
                     str(
