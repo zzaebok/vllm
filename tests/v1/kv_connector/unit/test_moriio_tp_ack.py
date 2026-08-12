@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import
     get_moriio_remote_tp_rank,
     resolve_moriio_transfer_ack,
     validate_moriio_heterogeneous_tp_kv_heads,
+)
+from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
+    MoRIIOWrapper,
+    MoRIIOWriter,
 )
 
 
@@ -324,3 +329,59 @@ def test_requested_cudagraph_mode_is_never_overridden():
     assert (
         MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": False}) is False
     )
+
+
+def test_aborted_write_transfer_is_terminal_and_releases_producer_state():
+    worker = MoRIIOConnectorWorker.__new__(MoRIIOConnectorWorker)
+    worker.moriio_config = SimpleNamespace(defer_timeout=5.0)
+    worker.moriio_wrapper = MoRIIOWrapper()
+    worker.moriio_wrapper.done_remote_allocate_req_dict["tx"] = object()
+    writer = MoRIIOWriter(worker)
+
+    writer.abort_transfer("tx")
+    writer._scheduled_writes["tx"] = 1
+    writer._scheduled_layers["tx"] = {"layer0"}
+    writer._sealed_writes["tx"] = 1
+    writer.abort_transfer("tx")
+
+    assert worker.moriio_wrapper.pop_finished_req_ids() == [MoRIIOTransferAck("tx")]
+    assert "tx" not in worker.moriio_wrapper.done_remote_allocate_req_dict
+    assert "tx" in worker.moriio_wrapper._terminal_transfer_ids
+    assert "tx" not in writer._scheduled_writes
+    assert "tx" not in writer._scheduled_layers
+    assert "tx" not in writer._sealed_writes
+
+
+@pytest.mark.parametrize("task_source", ["queued", "deferred"])
+def test_terminal_write_task_discard_clears_scheduled_state(task_source):
+    writer = MoRIIOWriter.__new__(MoRIIOWriter)
+    writer._write_state_lock = threading.Lock()
+    writer._scheduled_writes = {"tx": 2}
+    writer._scheduled_layers = {"tx": {"dense0", "indexer"}}
+    writer._sealed_writes = {"tx": 2}
+    writer._is_transfer_terminal = lambda transfer_id: transfer_id == "tx"
+    task = SimpleNamespace(transfer_id="tx")
+
+    if task_source == "deferred":
+        writer._deferred_tasks = [task]
+        writer._defer_timeout = 1.0
+        writer._process_deferred_tasks()
+        assert writer._deferred_tasks == []
+    else:
+        tasks = iter([task])
+
+        def get_task(timeout):
+            try:
+                return next(tasks)
+            except StopIteration as error:
+                raise RuntimeError("stop worker loop") from error
+
+        writer._deferred_tasks = []
+        writer._process_deferred_tasks = lambda: None
+        writer._write_task_q = SimpleNamespace(get=get_task)
+        with pytest.raises(RuntimeError, match="stop worker loop"):
+            writer._write_worker_loop()
+
+    assert "tx" not in writer._scheduled_writes
+    assert "tx" not in writer._scheduled_layers
+    assert "tx" not in writer._sealed_writes
