@@ -198,9 +198,6 @@ def test_flexible_round_robin_is_deterministic_uniform_and_staggered() -> None:
 
 
 def test_read_blocks_for_req_threads_chosen_tp() -> None:
-    # The resolved (chosen_tp, flexible) must reach _read_blocks, which keys the
-    # session AND the notify port off that single value -- so a read and its
-    # completion notify address the same prefill rank.
     worker = make_decode_worker(world_size=1, tp_rank=0, dp_rank=3)
     worker._read_blocks = MagicMock()
     worker._read_blocks_for_req("r", make_meta(p_tp=8, p_dp=1, remote_dp_rank=0))
@@ -208,3 +205,31 @@ def test_read_blocks_for_req_threads_chosen_tp() -> None:
     assert kw["flexible"] is True
     assert kw["chosen_tp"] == 3  # first flexible pick = dp_rank seed
     assert get_port_offset(0, kw["chosen_tp"], 8) == 3
+    assert kw["release_targets"] == [
+        ("phost0", str(61005 + tp_rank)) for tp_rank in range(8)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("decode_tp_rank", "decode_tp_size", "producer_tp_size", "producer_ranks"),
+    [
+        (2, 4, 8, [4, 5]),
+        (5, 8, 4, [2]),
+        (2, 4, 0, [2]),
+    ],
+)
+def test_read_release_endpoints_follow_the_producer_owners(
+    decode_tp_rank, decode_tp_size, producer_tp_size, producer_ranks
+) -> None:
+    worker = make_decode_worker(
+        world_size=decode_tp_size, tp_rank=decode_tp_rank, dp_rank=0
+    )
+    meta = make_meta(p_tp=producer_tp_size, p_dp=2, remote_dp_rank=1)
+
+    assert worker._get_read_release_targets(meta) == [
+        (
+            "phost0",
+            str(61005 + (producer_tp_size or decode_tp_size) + producer_rank),
+        )
+        for producer_rank in producer_ranks
+    ]

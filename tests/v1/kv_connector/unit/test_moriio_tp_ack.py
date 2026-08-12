@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import threading
+from collections import Counter
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOTransferAck,
     RemoteAllocInfo,
     WriteTask,
+    get_moriio_remote_tp_release_ranks,
     get_port_offset,
     resolve_peer_tp_size,
 )
@@ -66,7 +68,7 @@ def test_resolve_peer_tp_size_falls_back_when_unadvertised():
     assert resolve_peer_tp_size({"remote_tp_size": 8, "tp_size": 2}, 4) == 8
 
 
-def test_early_prefill_release_uses_producer_tp_size():
+def test_early_prefill_release_uses_producer_tp_size_and_consumer_fanin():
     scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
     scheduler.tp_size = 4
     sent = []
@@ -80,11 +82,15 @@ def test_early_prefill_release_uses_producer_tp_size():
             "remote_host": "producer",
             "remote_notify_port": 7000,
             "tp_size": 2,
+            "remote_dp_size": 2,
+            "remote_dp_size_local": 2,
         },
     )
 
     assert sent == [
         ("tx", "producer", 7000 + get_port_offset(1, 0, 2)),
+        ("tx", "producer", 7000 + get_port_offset(1, 0, 2)),
+        ("tx", "producer", 7000 + get_port_offset(1, 1, 2)),
         ("tx", "producer", 7000 + get_port_offset(1, 1, 2)),
     ]
 
@@ -242,7 +248,7 @@ def test_prefill_notify_endpoints_cover_the_producer_width(monkeypatch):
     assert endpoints == [("10.0.0.1", port) for port in range(7008, 7016)]
 
 
-def test_read_zero_transfer_releases_without_worker_metadata():
+def test_read_local_prefix_hit_releases_without_worker_metadata():
     scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
     scheduler.mode = MoRIIOMode.READ
     scheduler.is_producer = False
@@ -263,9 +269,14 @@ def test_read_zero_transfer_releases_without_worker_metadata():
         "remote_notify_port": 7000,
         "remote_tp_size": 2,
     }
-    request = SimpleNamespace(request_id="req-hit", kv_transfer_params=params)
+    request = SimpleNamespace(
+        request_id="req-hit",
+        kv_transfer_params=params,
+        prompt_token_ids=list(range(17)),
+    )
     blocks = SimpleNamespace(get_block_ids=lambda: [[1, 2]])
 
+    assert scheduler.get_num_new_matched_tokens(request, 16) == (0, False)
     scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
 
     assert releases == [("req-hit", "tx-hit")]
@@ -299,6 +310,85 @@ def test_read_abort_before_allocation_releases_without_worker_metadata():
     assert releases == [("req-abort", "tx-abort")]
     assert scheduler._reqs_need_recv == {}
     assert params["do_remote_prefill"] is False
+
+
+@pytest.mark.parametrize(
+    ("decode_tp_rank", "decode_tp_size", "producer_tp_size", "expected"),
+    [
+        (2, 4, 4, [2]),
+        (2, 4, 8, [4, 5]),
+        (5, 8, 4, [2]),
+        (0, 1, 8, list(range(8))),
+    ],
+)
+def test_read_release_targets_every_contributing_producer_rank(
+    decode_tp_rank, decode_tp_size, producer_tp_size, expected
+):
+    assert (
+        get_moriio_remote_tp_release_ranks(
+            decode_tp_rank, decode_tp_size, producer_tp_size
+        )
+        == expected
+    )
+
+
+def test_read_release_ranks_reject_non_multiple_tp():
+    with pytest.raises(ValueError, match="multiple"):
+        get_moriio_remote_tp_release_ranks(0, 6, 4)
+
+
+@pytest.mark.parametrize(
+    ("producer_tp_size", "decode_tp_size"), [(8, 4), (4, 8), (8, 1), (4, 4)]
+)
+def test_read_release_topology_matches_producer_ack_count(
+    producer_tp_size, decode_tp_size
+):
+    releases = Counter(
+        producer_rank
+        for decode_rank in range(decode_tp_size)
+        for producer_rank in get_moriio_remote_tp_release_ranks(
+            decode_rank, decode_tp_size, producer_tp_size
+        )
+    )
+    expected = get_moriio_expected_ack_count(producer_tp_size, decode_tp_size)
+
+    assert releases == Counter({rank: expected for rank in range(producer_tp_size)})
+
+
+@pytest.mark.parametrize(
+    ("producer_tp_size", "decode_tp_size", "expected_ack_count"),
+    [(8, 4, 1), (4, 8, 2), (4, 4, 1), (8, 1, 1)],
+)
+def test_scheduler_release_reaches_every_producer_rank(
+    producer_tp_size, decode_tp_size, expected_ack_count
+):
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.tp_size = decode_tp_size
+    sent = []
+    scheduler._send_transfer_release = lambda *args: sent.append(args)
+    params = {
+        "transfer_id": "tx-hit",
+        "remote_host": "127.0.0.1",
+        "remote_notify_port": 7000,
+        "remote_tp_size": producer_tp_size,
+        "remote_dp_rank": 1,
+        "remote_dp_size": 2,
+        "remote_dp_size_local": 2,
+    }
+
+    scheduler._release_prefill_blocks("req-hit", params)
+
+    expected = Counter(
+        {
+            (
+                "tx-hit",
+                "127.0.0.1",
+                7000 + get_port_offset(1, rank, producer_tp_size),
+            ): expected_ack_count
+            for rank in range(producer_tp_size)
+        }
+    )
+    assert Counter(sent) == expected
 
 
 def test_remote_tp_rank_p4_d8_floor_maps_decode_to_prefill():
@@ -568,7 +658,10 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     worker.moriio_wrapper = FakeWrapper()
     worker._recving_transfers = {"req": {"layer0": DoneStatus()}}
     worker._recving_transfers_callback_addr = {
-        "req": ("127.0.0.1", "7000", "tx-release")
+        "req": (
+            [("127.0.0.1", "7000"), ("127.0.0.1", "7001")],
+            "tx-release",
+        )
     }
     # Transfer-timeout reaping state consulted by _pop_done_transfers.
     worker._recving_transfers_start = {}
@@ -581,7 +674,14 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
             "7000",
             "release",
             {"consumer_tp_size": 8},
-        )
+        ),
+        (
+            "tx-release",
+            "127.0.0.1",
+            "7001",
+            "release",
+            {"consumer_tp_size": 8},
+        ),
     ]
     assert worker._recving_transfers == {}
     assert worker._recving_transfers_callback_addr == {}

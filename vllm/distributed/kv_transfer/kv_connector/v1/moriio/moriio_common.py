@@ -224,6 +224,17 @@ def get_moriio_remote_tp_rank(
     return local_tp_rank // (local_tp_size // remote_tp_size)
 
 
+def get_moriio_remote_tp_release_ranks(
+    local_tp_rank: int, local_tp_size: int, remote_tp_size: int
+) -> list[int]:
+    get_moriio_remote_tp_rank(local_tp_rank, local_tp_size, remote_tp_size)
+    if remote_tp_size >= local_tp_size:
+        ratio = remote_tp_size // local_tp_size
+        start = local_tp_rank * ratio
+        return list(range(start, start + ratio))
+    return [local_tp_rank // (local_tp_size // remote_tp_size)]
+
+
 def resolve_peer_tp_size(params: Mapping[str, Any], fallback: int) -> int:
     """Peer TP degree advertised in ``kv_transfer_params``.
 
