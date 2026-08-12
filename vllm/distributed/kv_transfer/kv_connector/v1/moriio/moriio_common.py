@@ -224,6 +224,22 @@ def get_moriio_remote_tp_rank(
     return local_tp_rank // (local_tp_size // remote_tp_size)
 
 
+def validate_moriio_write_tp_topology(
+    producer_tp_size: int, decode_tp_size: int
+) -> None:
+    if producer_tp_size <= 0 or decode_tp_size <= 0:
+        raise ValueError("TP sizes must be positive")
+    if decode_tp_size > producer_tp_size:
+        raise NotImplementedError(
+            "MoRIIO WRITE does not support decode TP larger than producer TP"
+        )
+    if producer_tp_size % decode_tp_size != 0:
+        raise ValueError(
+            f"producer tp_size {producer_tp_size} must be a multiple of "
+            f"decode tp_size {decode_tp_size} for MoRIIO WRITE"
+        )
+
+
 def resolve_peer_tp_size(params: Mapping[str, Any], fallback: int) -> int:
     """Peer TP degree advertised in ``kv_transfer_params``.
 

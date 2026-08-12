@@ -49,6 +49,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     resolve_host_ip,
     resolve_peer_tp_size,
     set_role,
+    validate_moriio_write_tp_topology,
     zmq_ctx,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_engine import (
@@ -478,8 +479,10 @@ class MoRIIOConnectorScheduler:
 
         token_ids = request.prompt_token_ids or []
         if self.mode == MoRIIOMode.WRITE:
-            # MoriiO in write mode, no remote prefill
-
+            producer_tp_size = resolve_peer_tp_size(
+                request.kv_transfer_params or {}, self.tp_size
+            )
+            validate_moriio_write_tp_topology(producer_tp_size, self.tp_size)
             return len(token_ids) - num_computed_tokens, True
 
         return len(token_ids) - 1 - num_computed_tokens, False
@@ -589,7 +592,9 @@ class MoRIIOConnectorScheduler:
             for producer_tp_rank in range(producer_tp_size)
         ]
 
-    def _release_write_prefill_blocks(self, request_id: ReqId, params: dict[str, Any]):
+    def _release_write_prefill_blocks(
+        self, request_id: ReqId, params: dict[str, Any]
+    ) -> None:
         transfer_id = params.get("transfer_id")
         if transfer_id is None:
             logger.warning(
@@ -599,31 +604,8 @@ class MoRIIOConnectorScheduler:
             )
             return
 
-        remote_dp_rank = params.get("remote_dp_rank", 0)
-        remote_host = params.get("remote_host")
-        remote_notify_port = params.get("remote_notify_port")
-        if remote_host is None or remote_notify_port is None:
-            try:
-                peer_zmq = get_peer_zmq_from_request_id(request_id, is_producer=False)
-                if peer_zmq is None:
-                    raise ValueError("no peer zmq address for request")
-                remote_host, _, remote_notify_port = parse_moriio_zmq_address(peer_zmq)
-            except ValueError:
-                logger.warning(
-                    "Cannot release WRITE prefill blocks for request %s: "
-                    "missing remote notify address",
-                    request_id,
-                )
-                return
-
-        remote_notify_port = int(remote_notify_port)
-        # Address the producer's TP port layout, not the decoder's.
-        producer_tp_size = resolve_peer_tp_size(params, self.tp_size)
-        for tp_index in range(producer_tp_size):
-            target_port = remote_notify_port + get_port_offset(
-                int(remote_dp_rank), tp_index, producer_tp_size
-            )
-            self._send_transfer_release(transfer_id, remote_host, target_port)
+        for host, port in self._prefill_notify_endpoints(request_id, params):
+            self._send_transfer_release(transfer_id, host, port)
 
     def update_state_after_alloc(
         self,
@@ -766,72 +748,22 @@ class MoRIIOConnectorScheduler:
                 else:
                     _should_notify = self._is_kv_master
                 if _should_notify:
-                    peer_zmq = get_peer_zmq_from_request_id(
-                        request.request_id, is_producer=False
-                    )
-                    if peer_zmq is not None:
-                        remote_host, _, remote_notify_port = parse_moriio_zmq_address(
-                            peer_zmq
-                        )
+                    producer_tp_size = resolve_peer_tp_size(params, self.tp_size)
+                    validate_moriio_write_tp_topology(producer_tp_size, self.tp_size)
+                    if num_external_tokens == 0:
+                        self._release_write_prefill_blocks(request.request_id, params)
                     else:
-                        # Sidecar fallback: use explicit params fields.
-                        params = request.kv_transfer_params or {}
-                        remote_host = params.get("remote_host") or ""
-                        try:
-                            remote_notify_port = int(
-                                params.get("remote_notify_port") or 0
+                        block_notify_list = blocks.get_block_ids()[0]
+                        for notify_host, target_port in self._prefill_notify_endpoints(
+                            request.request_id, params
+                        ):
+                            self.send_notify_block(
+                                req_id=request.request_id,
+                                transfer_id=params["transfer_id"],
+                                block_notify_list=block_notify_list,
+                                host=notify_host,
+                                port=target_port,
                             )
-                        except (TypeError, ValueError):
-                            remote_notify_port = 0
-                        if not remote_host or not remote_notify_port:
-                            raise ValueError(
-                                f"request {request.request_id!r}: "
-                                f"request_id has no embedded peer "
-                                f"zmq_address and kv_transfer_params is "
-                                f"missing remote_host / remote_notify_port "
-                                f"(got remote_host={remote_host!r}, "
-                                f"remote_notify_port={remote_notify_port!r})"
-                            )
-
-                    # num_external_tokens == 0: nothing to push, so don't tell
-                    # the producer to write into these blocks.
-                    block_notify_list = (
-                        blocks.get_block_ids()[0] if num_external_tokens > 0 else []
-                    )
-
-                    # Wide-EP multi-pod: a pod binds notify sockets only for
-                    # its LOCAL ranks, so the port offset must use the per-pod
-                    # local rank (% dp_local), not the global rank. Single-pod
-                    # is bit-identical (modulus is a no-op).
-                    _remote_dp_rank_for_port = fold_local_rank(
-                        remote_dp_rank, _dp_local
-                    )
-                    # The target rank may live on a child pod at a different IP,
-                    # so resolve the per-pod host (pod_idx = global // dp_local).
-                    # Otherwise a notify for child ranks lands on the master
-                    # pod and the request hangs in WAITING_FOR_REMOTE_KVS.
-                    _notify_host = remote_host
-                    _kvp = request.kv_transfer_params or {}
-                    _remote_hosts = _kvp.get("remote_hosts") or []
-                    if _dp_local > 0 and _remote_hosts:
-                        _pod_idx = pod_index(remote_dp_rank, _dp_local)
-                        if 0 <= _pod_idx < len(_remote_hosts):
-                            _notify_host = _remote_hosts[_pod_idx]
-                    # Producer's TP degree, not ours: its ranks bind at
-                    # base + dp_local * producer_tp + tp.
-                    _producer_tp_size = resolve_peer_tp_size(_kvp, self.tp_size)
-                    for tp_index in range(_producer_tp_size):
-                        target_port = remote_notify_port + get_port_offset(
-                            _remote_dp_rank_for_port, tp_index, _producer_tp_size
-                        )
-
-                        self.send_notify_block(
-                            req_id=request.request_id,
-                            transfer_id=request.kv_transfer_params["transfer_id"],
-                            block_notify_list=block_notify_list,
-                            host=_notify_host,
-                            port=target_port,
-                        )
 
             # Only trigger 1 KV transfer per request.
 

@@ -17,6 +17,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     WriteTask,
     get_port_offset,
     resolve_peer_tp_size,
+    validate_moriio_write_tp_topology,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_connector import (
     MoRIIOConnector,
@@ -79,6 +80,8 @@ def test_early_write_release_uses_producer_tp_size():
             "remote_host": "producer",
             "remote_notify_port": 7000,
             "tp_size": 2,
+            "remote_dp_size": 2,
+            "remote_dp_size_local": 2,
         },
     )
 
@@ -239,6 +242,107 @@ def test_prefill_notify_endpoints_cover_the_producer_width(monkeypatch):
     )
 
     assert endpoints == [("10.0.0.1", port) for port in range(7008, 7016)]
+
+
+@pytest.mark.parametrize(
+    ("producer_tp_size", "decode_tp_size"), [(8, 4), (4, 4), (0, 4)]
+)
+def test_write_topology_is_validated_before_allocation(
+    producer_tp_size, decode_tp_size
+):
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.is_producer = False
+    scheduler.mode = MoRIIOMode.WRITE
+    scheduler.tp_size = decode_tp_size
+    request = SimpleNamespace(
+        prompt_token_ids=list(range(17)),
+        kv_transfer_params={"remote_tp_size": producer_tp_size},
+    )
+
+    assert scheduler.get_num_new_matched_tokens(request, 0) == (17, True)
+
+
+@pytest.mark.parametrize(
+    ("producer_tp_size", "decode_tp_size", "error"),
+    [(2, 4, NotImplementedError), (4, 3, ValueError)],
+)
+def test_write_topology_rejects_unsupported_layout_before_allocation(
+    producer_tp_size, decode_tp_size, error
+):
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.is_producer = False
+    scheduler.mode = MoRIIOMode.WRITE
+    scheduler.tp_size = decode_tp_size
+    request = SimpleNamespace(
+        prompt_token_ids=list(range(17)),
+        kv_transfer_params={"remote_tp_size": producer_tp_size},
+    )
+
+    with pytest.raises(error):
+        scheduler.get_num_new_matched_tokens(request, 0)
+
+
+def _write_decode_scheduler(tp_size=4):
+    scheduler = MoRIIOConnectorScheduler.__new__(MoRIIOConnectorScheduler)
+    scheduler.mode = MoRIIOMode.WRITE
+    scheduler.is_producer = False
+    scheduler.tp_size = tp_size
+    scheduler._global_dp_rank = 0
+    scheduler._is_kv_master = True
+    scheduler._reqs_need_save = {}
+    scheduler._req_kv_params = {}
+    scheduler.map_request_id = lambda request_id, transfer_id: None
+    return scheduler
+
+
+def test_write_block_ready_reaches_every_producer_rank():
+    scheduler = _write_decode_scheduler()
+    sent = []
+    scheduler.send_notify_block = lambda **kwargs: sent.append(kwargs)
+    params = {
+        "do_remote_prefill": True,
+        "transfer_id": "tx-write",
+        "remote_host": "127.0.0.1",
+        "remote_notify_port": 7000,
+        "remote_tp_size": 8,
+        "remote_dp_rank": 0,
+        "remote_dp_size": 1,
+        "remote_dp_size_local": 1,
+    }
+    request = SimpleNamespace(request_id="req-write", kv_transfer_params=params)
+    blocks = SimpleNamespace(get_block_ids=lambda: [[11, 12]])
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=1)
+
+    assert [message["port"] for message in sent] == list(range(7000, 7008))
+    assert {tuple(message["block_notify_list"]) for message in sent} == {(11, 12)}
+
+
+def test_unchosen_write_connector_releases_instead_of_staging_empty_write():
+    scheduler = _write_decode_scheduler()
+    released = []
+    staged = []
+    scheduler._release_write_prefill_blocks = lambda *args: released.append(args)
+    scheduler.send_notify_block = lambda **kwargs: staged.append(kwargs)
+    params = {
+        "do_remote_prefill": True,
+        "transfer_id": "tx-write",
+        "remote_host": "127.0.0.1",
+        "remote_notify_port": 7000,
+        "remote_tp_size": 8,
+    }
+    request = SimpleNamespace(request_id="req-write", kv_transfer_params=params)
+    blocks = SimpleNamespace(get_block_ids=lambda: [[11, 12]])
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    assert released == [("req-write", params)]
+    assert staged == []
+
+
+def test_write_topology_validator_rejects_nonpositive_sizes():
+    with pytest.raises(ValueError, match="positive"):
+        validate_moriio_write_tp_topology(0, 4)
 
 
 def test_remote_tp_rank_p4_d8_floor_maps_decode_to_prefill():
