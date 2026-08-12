@@ -314,13 +314,9 @@ def test_read_completion_sends_structured_release_with_consumer_tp_size():
     assert worker._recving_transfers_callback_addr == {}
 
 
-def test_requested_cudagraph_mode_is_never_overridden():
-    # The configured cudagraph mode is always honored: the barrier fires when
-    # the operator sets cudagraph_mode=PIECEWISE, and READ mode with full
-    # graphs only warns instead of silently forcing PIECEWISE.
-    assert (
-        MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": True}) is False
-    )
+def test_read_mode_requires_piecewise_cudagraphs():
+    assert MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": True})
+    assert MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": "1"})
     assert (
         MoRIIOConnector.requires_piecewise_for_cudagraph({"read_mode": False}) is False
     )

@@ -35,6 +35,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.moriio.moriio_common import (
     MoRIIOTransferAck,
     ReqId,
     ReqMeta,
+    TransferError,
     TransferId,
     WriteTask,
     fold_local_rank,
@@ -190,6 +191,13 @@ def resolve_moriio_transfer_ack(
 
 
 class MoRIIOConnector(KVConnectorBase_V1):
+    @classmethod
+    def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
+        return str(extra_config.get("read_mode", "false")).lower().strip() in (
+            "true",
+            "1",
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -215,13 +223,10 @@ class MoRIIOConnector(KVConnectorBase_V1):
             and self.kv_transfer_config.is_kv_consumer
             and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
         ):
-            # warn only; kv-read barrier requires PIECEWISE cudagraph mode
-            logger.warning_once(
-                "MoRIIO READ mode is running with %s CUDA graphs: per-layer "
-                "KV-read barrier can't fire inside full graph; accuracy may "
-                "degrade at high concurrency. Set cudagraph_mode=PIECEWISE "
-                "in --compilation-config.",
-                vllm_config.compilation_config.cudagraph_mode.name,
+            raise ValueError(
+                "MoRIIO READ requires PIECEWISE CUDA graphs so its per-layer "
+                "KV-load barriers execute. VllmConfig normally applies this "
+                "requirement before connector construction."
             )
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: MoRIIOConnectorScheduler | None = (
@@ -1920,7 +1925,10 @@ class MoRIIOConnectorWorker:
             return
 
         if get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL:
-            return
+            raise TransferError(
+                "MoRIIO READ layer barriers cannot run inside a full CUDA graph; "
+                "use cudagraph_mode=PIECEWISE"
+            )
 
         deadline = time.monotonic() + self.moriio_config.transfer_timeout
         while True:
