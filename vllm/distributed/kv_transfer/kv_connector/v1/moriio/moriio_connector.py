@@ -438,6 +438,8 @@ class MoRIIOConnectorScheduler:
         )
         # Buffer for early ACKs that arrive before request_finished.
         self._pending_sent_acks: dict[ReqId, float] = {}
+        # Producer TP degrees already declined; keeps the log to one line each.
+        self._declined_producer_tp_sizes: set[int] = set()
         self.paths: dict[str, zmq.Socket] = {}
         self.transfer_id_to_request_id: dict[TransferId, ReqId] = {}
         self.request_id_to_transfer_id: dict[ReqId, TransferId] = {}
@@ -501,7 +503,46 @@ class MoRIIOConnectorScheduler:
 
         token_ids = request.prompt_token_ids or []
         if self.mode == MoRIIOMode.WRITE:
-            # MoriiO in write mode, no remote prefill
+            # MoRIIO in write mode, no remote prefill.
+            #
+            # The write path copies whole KV blocks with no head offset, so a
+            # heterogeneous P/D layout is only addressable when both sides
+            # replicate KV heads. Otherwise every producer rank writes its
+            # half-width shard to the same offset and the decode serves
+            # garbage -- with a 200 and fluent-looking text, so nothing
+            # upstream notices. Refuse the disaggregated path for this
+            # request instead; 0 external tokens makes the decode prefill it
+            # locally, which is correct, just not disaggregated.
+            #
+            # This runs in the scheduler inside EngineCore, so it must not
+            # raise: that would kill the engine for every other request.
+            params = request.kv_transfer_params or {}
+            try:
+                peer_tp_size = int(
+                    params.get("remote_tp_size") or params.get("tp_size") or 0
+                )
+            except (TypeError, ValueError):
+                peer_tp_size = 0
+            producer_tp_size = peer_tp_size if peer_tp_size > 0 else self.tp_size
+            model_config = self.vllm_config.model_config
+            try:
+                validate_moriio_heterogeneous_tp_kv_heads(
+                    local_tp_size=self.tp_size,
+                    remote_tp_size=producer_tp_size,
+                    total_num_kv_heads=model_config.get_total_num_kv_heads(),
+                    is_mla=model_config.use_mla,
+                )
+            except (ValueError, NotImplementedError) as exc:
+                if producer_tp_size not in self._declined_producer_tp_sizes:
+                    self._declined_producer_tp_sizes.add(producer_tp_size)
+                    logger.error(
+                        "MoRIIO cannot address a WRITE transfer from producer "
+                        "TP=%d to decode TP=%d; prefilling locally instead: %s",
+                        producer_tp_size,
+                        self.tp_size,
+                        exc,
+                    )
+                return 0, False
 
             return len(token_ids) - num_computed_tokens, True
 
